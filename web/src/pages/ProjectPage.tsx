@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { FolderInput, FolderMinus, Loader2, MessageSquare, MessageSquarePlus, Pin, Play, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { PERMISSION_MODES, PERMISSION_MODE_LABELS, type ConversationDTO, type PermissionMode, type ProjectDTO } from "@edgemind/shared";
@@ -22,6 +22,8 @@ import { api } from "@/lib/api";
 import { modelLabel, useWorkspace } from "@/lib/workspace";
 
 export function ProjectPage() {
+  const [search, setSearch] = useSearchParams();
+  const tab = search.get("tab") ?? "chats";
   const { id } = useParams();
   const navigate = useNavigate();
   const ws = useWorkspace();
@@ -76,7 +78,7 @@ export function ProjectPage() {
         )}
         <Button onClick={() => navigate(`/?project=${p.id}`)}><MessageSquarePlus /> 在專案中新對話</Button>
       </div>
-      <Tabs defaultValue="chats">
+      <Tabs value={tab} onValueChange={(v) => setSearch(v === "chats" ? {} : { tab: v }, { replace: true })}>
         <TabsList>
           <TabsTrigger value="chats">對話</TabsTrigger>
           <TabsTrigger value="settings">設定</TabsTrigger>

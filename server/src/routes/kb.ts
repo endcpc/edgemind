@@ -352,6 +352,19 @@ export function mountKb(app: Hono<HonoEnv>, deps: AppDeps) {
     return c.json({ document: docDTO(doc), total: doc.chunkCount, offset, chunks: out });
   });
 
+  app.get("/kb/documents/:id/view", async (c) => {
+    const doc = await getDoc(c, c.req.param("id"));
+    if (!doc?.fileId) return c.json({ error: "not_found", message: "找不到文件" }, 404);
+    const [f] = await c.get("database").db.select().from(files).where(eq(files.id, doc.fileId)).limit(1);
+    if (!f || f.status === "deleted") return c.json({ error: "not_found", message: "原檔不存在" }, 404);
+    const download = c.req.query("download") === "1";
+    const url = await s3(c).presign("GET", f.s3Key, 600, {
+      "response-content-disposition": `${download ? "attachment" : "inline"}; filename*=UTF-8''${encodeURIComponent(doc.name)}`,
+      "response-content-type": f.mime ?? guessMime(doc.name),
+    });
+    return c.json({ url, mime: f.mime ?? guessMime(doc.name) });
+  });
+
   app.delete("/kb/documents/:id", async (c) => {
     const doc = await getDoc(c, c.req.param("id"));
     if (!doc) return c.json({ error: "not_found", message: "找不到文件" }, 404);

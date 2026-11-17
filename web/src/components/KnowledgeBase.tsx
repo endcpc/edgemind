@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type DragEvent } from "react";
-import { BookOpen, ChevronDown, ChevronRight, Eye, Loader2, Pencil, Plus, RefreshCw, Search, Trash2, Upload } from "lucide-react";
+import { BookOpen, ChevronDown, ChevronRight, Download, ExternalLink, Eye, Loader2, Pencil, Plus, RefreshCw, Search, Trash2, Upload } from "lucide-react";
 import { toast } from "sonner";
 import {
   getKindSpec, type KbChunkDTO, type KbCollectionDTO, type KbDocumentDTO, type KbIndexProgress, type KbSearchHit, type ProviderDTO, type UploadTicket,
@@ -189,6 +189,14 @@ function CollectionBody({ col, onChanged, onIngested }: { col: KbCollectionDTO; 
   const [jobs, setJobs] = useState<Job[]>([]);
   const [drag, setDrag] = useState(false);
   const [viewing, setViewing] = useState<KbDocumentDTO | null>(null);
+  async function openOriginal(d: KbDocumentDTO, download: boolean) {
+    try {
+      const { url } = await api<{ url: string }>(`/kb/documents/${d.id}/view${download ? "?download=1" : ""}`);
+      window.open(url, "_blank", "noopener");
+    } catch (e) {
+      toast.error((e as Error).message);
+    }
+  }
   const [deleting, setDeleting] = useState<KbDocumentDTO | null>(null);
   const input = useRef<HTMLInputElement>(null);
 
@@ -290,6 +298,8 @@ function CollectionBody({ col, onChanged, onIngested }: { col: KbCollectionDTO; 
                 <td>{col.embeddingDim ? `${d.embeddedCount}/${d.chunkCount}` : "—"}</td>
                 <td title={d.error ?? ""} className={d.status === "error" ? "text-destructive" : ""}>{DOC_STATUS[d.status] ?? d.status}</td>
                 <td className="whitespace-nowrap text-right">
+                  <Button size="icon" variant="ghost" title="開啟原檔" onClick={() => openOriginal(d, false)}><ExternalLink className="h-4 w-4" /></Button>
+                  <Button size="icon" variant="ghost" title="下載原檔" onClick={() => openOriginal(d, true)}><Download className="h-4 w-4" /></Button>
                   <Button size="icon" variant="ghost" title="檢視切塊" onClick={() => setViewing(d)}><Eye className="h-4 w-4" /></Button>
                   <Button size="icon" variant="ghost" title="刪除文件" onClick={() => setDeleting(d)}><Trash2 className="h-4 w-4" /></Button>
                 </td>

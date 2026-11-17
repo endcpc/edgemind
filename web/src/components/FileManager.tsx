@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
-import { Download, FileText, Folder, History, Loader2, RefreshCw, Trash2, Upload } from "lucide-react";
+import { Download, Eye, FilePlus, FileText, Folder, History, Loader2, RefreshCw, Trash2, Upload } from "lucide-react";
 import { toast } from "sonner";
 import type { FileDTO, FileVersionDTO } from "@edgemind/shared";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { ConfirmDialog } from "@/components/PromptDialog";
+import { ConfirmDialog, PromptDialog } from "@/components/PromptDialog";
+import { FileViewer } from "@/components/FileViewer";
 import { api } from "@/lib/api";
 import { uploadFile } from "@/lib/upload";
 
@@ -19,13 +20,15 @@ interface Job {
   error?: string;
 }
 
-/** Project files: browser-direct S3 uploads (multipart for big files), versions, download, delete. */
+/** Project files: browser-direct S3 uploads (multipart for big files), preview / edit text files, versions, download, delete. */
 export function FileManager({ projectId }: { projectId: string }) {
   const [rows, setRows] = useState<FileDTO[] | null>(null);
   const [folder, setFolder] = useState("");
   const [jobs, setJobs] = useState<Job[]>([]);
   const [versionsOf, setVersionsOf] = useState<FileDTO | null>(null);
   const [deleting, setDeleting] = useState<FileDTO | null>(null);
+  const [viewing, setViewing] = useState<FileDTO | null>(null);
+  const [creating, setCreating] = useState(false);
   const [drag, setDrag] = useState(false);
   const input = useRef<HTMLInputElement>(null);
 
@@ -89,7 +92,7 @@ export function FileManager({ projectId }: { projectId: string }) {
     <Card>
       <CardHeader>
         <CardTitle>專案檔案</CardTitle>
-        <CardDescription>檔案直接從瀏覽器上傳到物件儲存（大檔自動分段）。模型可用 file_* 工具讀寫；每次覆寫都會保留舊版本。</CardDescription>
+        <CardDescription>檔案直接從瀏覽器上傳到物件儲存（大檔自動分段）。點檔名可預覽，文字檔（≤ 2 MB）可直接編輯；模型可用 file_* 工具讀寫；每次覆寫都會保留舊版本。</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div
@@ -103,6 +106,7 @@ export function FileManager({ projectId }: { projectId: string }) {
           <div className="flex flex-wrap items-center justify-center gap-2">
             <Input value={folder} onChange={(e) => setFolder(e.target.value)} placeholder="上傳到資料夾（選填，例如 docs）" className="h-8 w-64" />
             <Button size="sm" onClick={() => input.current?.click()}><Upload /> 選擇檔案</Button>
+            <Button size="sm" variant="outline" onClick={() => setCreating(true)}><FilePlus /> 新增文字檔</Button>
             <Button size="sm" variant="ghost" onClick={load} title="重新整理" aria-label="重新整理"><RefreshCw /></Button>
           </div>
           <input ref={input} type="file" multiple hidden onChange={(e) => { if (e.target.files) upload(e.target.files); e.target.value = ""; }} />
@@ -131,8 +135,9 @@ export function FileManager({ projectId }: { projectId: string }) {
                 {list.map((f) => (
                   <div key={f.id} className="group flex items-center gap-2 px-3 py-2">
                     <FileText className="h-4 w-4 shrink-0 text-muted-foreground" />
-                    <span className="truncate" title={f.path}>{dir ? f.path.slice(dir.length + 1) : f.path}</span>
+                    <button className="truncate text-left hover:underline" title={`預覽／編輯 ${f.path}`} onClick={() => setViewing(f)}>{dir ? f.path.slice(dir.length + 1) : f.path}</button>
                     <span className="ml-auto shrink-0 text-xs text-muted-foreground">{fmtSize(f.size)} · v{f.version}</span>
+                    <Button variant="ghost" size="icon" className="h-7 w-7" title="預覽／編輯" aria-label="預覽／編輯" onClick={() => setViewing(f)}><Eye /></Button>
                     <Button variant="ghost" size="icon" className="h-7 w-7" title="下載" aria-label="下載" onClick={() => download(f)}><Download /></Button>
                     <Button variant="ghost" size="icon" className="h-7 w-7" title="版本紀錄" aria-label="版本紀錄" onClick={() => setVersionsOf(f)}><History /></Button>
                     <Button variant="ghost" size="icon" className="h-7 w-7 text-destructive" title="刪除" aria-label="刪除" onClick={() => setDeleting(f)}><Trash2 /></Button>
@@ -143,6 +148,27 @@ export function FileManager({ projectId }: { projectId: string }) {
           </div>
         )}
       </CardContent>
+      <FileViewer file={viewing} onClose={() => setViewing(null)} onSaved={load} onDownload={download} />
+      <PromptDialog
+        open={creating}
+        onOpenChange={setCreating}
+        title="新增文字檔"
+        description="輸入路徑與副檔名，例如 notes/todo.md；上方填了資料夾時會放進該資料夾。"
+        placeholder="notes/todo.md"
+        confirmLabel="建立"
+        onSubmit={async (path) => {
+          const prefix = folder.trim().replace(/^\/+|\/+$/g, "");
+          const full = prefix && !path.includes("/") ? `${prefix}/${path.trim()}` : path.trim();
+          try {
+            const f = await api<FileDTO>(`/projects/${projectId}/files/text`, { method: "POST", body: { path: full, text: "" } });
+            setCreating(false);
+            await load();
+            setViewing(f);
+          } catch (e) {
+            toast.error((e as Error).message);
+          }
+        }}
+      />
       <VersionsDialog file={versionsOf} onClose={() => setVersionsOf(null)} onRestored={load} />
       <ConfirmDialog open={!!deleting} onOpenChange={(v) => !v && setDeleting(null)} title="刪除檔案？" destructive confirmLabel="刪除"
         description={`「${deleting?.path}」會從專案移除；內容仍保留在版本紀錄中。`}

@@ -5,6 +5,9 @@
  *   POST /api/uploads/:fileId/abort
  *   GET  /api/projects/:id/files              project file list
  *   GET  /api/files/:id | /download | /versions ; POST /api/files/:id/restore { version } ; DELETE /api/files/:id
+ *   GET  /api/files/:id/view                  presigned inline URL (image / PDF preview)
+ *   GET  /api/files/:id/content ; PUT { text, baseVersion? }   view / edit a text file (≤ 2 MB) in the browser
+ *   POST /api/projects/:id/files/text         { path, text } create a new text file
  *   GET  /api/storage/status ; POST /api/storage/cors { origin? }   bucket CORS for the app origin (also applied automatically on first upload)
  */
 import type { Hono } from "hono";
@@ -15,7 +18,7 @@ import { files, projects } from "../db/schema";
 import { BadInput } from "../lib/errors";
 import { getSetting, setSetting } from "../lib/settings";
 import { S3, S3Error } from "../storage/s3";
-import { FileStore, guessMime, normalizePath, projectFileKey, toFileDTO } from "../storage/files";
+import { FileStore, guessMime, isTextMime, normalizePath, projectFileKey, toFileDTO } from "../storage/files";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuid = (v: unknown): v is string => typeof v === "string" && UUID.test(v);
@@ -76,6 +79,9 @@ export async function issueUploadTicket(c: Ctx, deps: AppDeps, row: typeof files
   }
   return { ...ticket, ...(cors.error ? { corsWarning: `無法自動設定 Bucket CORS：${cors.error}` } : {}) };
 }
+
+/** Text files viewable / editable in the browser (also keeps the JSON body under Netlify's 6 MB limit). */
+export const TEXT_EDIT_MAX = 2 * 1024 * 1024;
 
 export const safeName = (n: string) => n.replace(/[\\/\x00-\x1f]/g, "_").replace(/^\.+/, "_").slice(0, 200) || "file";
 
@@ -191,6 +197,56 @@ export function mountFiles(app: Hono<HonoEnv>, deps: AppDeps) {
     const name = row.path.split("/").pop() ?? "file";
     const url = await s3For(c, deps).presign("GET", row.s3Key, 600, { "response-content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(name)}` });
     return c.json({ url });
+  });
+
+  app.get("/files/:id/view", async (c) => {
+    const row = await rowOr404(c, c.req.param("id"));
+    if (!row || row.status !== "ready") return c.json({ error: "not_found", message: "找不到檔案" }, 404);
+    const name = row.path.split("/").pop() ?? "file";
+    const url = await s3For(c, deps).presign("GET", row.s3Key, 600, {
+      "response-content-disposition": `inline; filename*=UTF-8''${encodeURIComponent(name)}`,
+      "response-content-type": row.mime ?? guessMime(row.path),
+    });
+    return c.json({ url, mime: row.mime ?? guessMime(row.path) });
+  });
+
+  app.get("/files/:id/content", async (c) => {
+    const row = await rowOr404(c, c.req.param("id"));
+    if (!row || row.status !== "ready") return c.json({ error: "not_found", message: "找不到檔案" }, 404);
+    if (!isTextMime(row.mime, row.path)) return c.json({ error: "not_text", message: "這不是文字檔，無法線上編輯；請下載後開啟" }, 415);
+    if (row.size > TEXT_EDIT_MAX) return c.json({ error: "too_large", message: "文字檔超過 2 MB，請下載後編輯" }, 413);
+    const bytes = await fileStore(c, deps).readBytes(row);
+    return c.json({ text: new TextDecoder("utf-8").decode(bytes), version: row.version });
+  });
+
+  app.put("/files/:id/content", async (c) => {
+    const row = await rowOr404(c, c.req.param("id"));
+    if (!row || row.status !== "ready" || row.scope !== "project" || !row.projectId) return c.json({ error: "not_found", message: "找不到檔案" }, 404);
+    if (!isTextMime(row.mime, row.path)) throw new BadInput("只能線上編輯文字檔");
+    const body = await c.req.json().catch(() => null);
+    if (typeof body?.text !== "string") throw new BadInput("text 必須是字串");
+    if (Number.isInteger(body.baseVersion) && body.baseVersion !== row.version) {
+      return c.json({ error: "conflict", message: `檔案已被修改（目前是 v${row.version}），請重新載入後再編輯` }, 409);
+    }
+    const data = new TextEncoder().encode(body.text);
+    if (data.length > TEXT_EDIT_MAX) throw new BadInput("文字檔超過 2 MB，無法線上儲存");
+    return c.json(toFileDTO(await fileStore(c, deps).write(row.projectId, row.path, data, row.mime ?? undefined)));
+  });
+
+  app.post("/projects/:id/files/text", async (c) => {
+    const pid = c.req.param("id");
+    if (!isUuid(pid)) return c.json({ error: "not_found" }, 404);
+    const [p] = await c.get("database").db.select({ id: projects.id }).from(projects).where(eq(projects.id, pid)).limit(1);
+    if (!p) return c.json({ error: "not_found", message: "找不到專案" }, 404);
+    const body = await c.req.json().catch(() => null);
+    const path = normalizePath(body?.path);
+    const text = typeof body?.text === "string" ? body.text : "";
+    const store = fileStore(c, deps);
+    const existing = await store.find(pid, path);
+    if (existing?.status === "ready") return c.json({ error: "exists", message: `「${path}」已存在` }, 409);
+    const data = new TextEncoder().encode(text);
+    if (data.length > TEXT_EDIT_MAX) throw new BadInput("文字檔超過 2 MB");
+    return c.json(toFileDTO(await store.write(pid, path, data)), 201);
   });
 
   app.get("/files/:id/versions", async (c) => {

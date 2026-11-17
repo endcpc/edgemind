@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
-import { AlertTriangle, Archive, Download, BarChart3, CalendarClock, ArchiveRestore, ChevronDown, ChevronRight, FolderInput, FolderMinus, FolderOpen, FolderPlus, LogOut, MessageSquarePlus, MoreHorizontal, Pencil, Pin, PinOff, Plus, Search, Settings, SlidersHorizontal, Trash2, X } from "lucide-react";
+import { AlertTriangle, Archive, ArchiveRestore, BarChart3, BookOpen, CalendarClock, ChevronDown, ChevronRight, Download, FileText, FolderInput, FolderMinus, FolderOpen, FolderPlus, LogOut, MessageSquarePlus, MoreHorizontal, Pencil, Pin, PinOff, Plus, Search, Settings, SlidersHorizontal, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import type { ConversationDTO, ProjectDTO, SpendStatus } from "@edgemind/shared";
 import { Button } from "@/components/ui/button";
@@ -206,8 +206,8 @@ function ProjectItem({ p, convs, open, activeId, pageActive, onToggle, onOpen, o
           <FolderOpen className="h-4 w-4 shrink-0 text-muted-foreground" />
           <span className={cn("truncate", pageActive && "font-medium")}>{p.name}</span>
         </button>
-        <span className="text-xs text-muted-foreground group-hover:hidden">{convs.length || ""}</span>
-        <Link to={`/p/${p.id}`} onClick={onNavigate} className="mr-1 hidden rounded p-1 text-muted-foreground hover:text-foreground group-hover:block" title="專案首頁（對話列表與設定）" aria-label={`${p.name} 專案首頁`}>
+        <span className="text-xs text-muted-foreground">{convs.length || ""}</span>
+        <Link to={`/p/${p.id}`} onClick={onNavigate} className="mr-1 rounded p-1 text-muted-foreground hover:text-foreground" title="專案首頁（對話、檔案、知識庫與設定）" aria-label={`${p.name} 專案首頁`}>
           <SlidersHorizontal className="h-3.5 w-3.5" />
         </Link>
       </div>
@@ -217,6 +217,14 @@ function ProjectItem({ p, convs, open, activeId, pageActive, onToggle, onOpen, o
             onClick={() => { navigate(`/?project=${p.id}`); onNavigate?.(); }}>
             <MessageSquarePlus className="h-3.5 w-3.5" /> 在專案中新對話
           </button>
+          <div className="flex gap-1">
+            <Link to={`/p/${p.id}?tab=files`} onClick={onNavigate} className="flex flex-1 items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground">
+              <FileText className="h-3.5 w-3.5" /> 檔案
+            </Link>
+            <Link to={`/p/${p.id}?tab=kb`} onClick={onNavigate} className="flex flex-1 items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground">
+              <BookOpen className="h-3.5 w-3.5" /> 知識庫
+            </Link>
+          </div>
           {shown.map((c) => <ConversationItem key={c.id} c={c} active={c.id === activeId} onNavigate={onNavigate} />)}
           {convs.length > 8 && (
             <button className="px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground" onClick={() => setAll((v) => !v)}>{all ? "顯示較少" : `顯示全部 ${convs.length} 個對話`}</button>
