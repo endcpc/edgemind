@@ -67,7 +67,7 @@ export function ModelsDialog({ provider, onOpenChange }: { provider: ProviderDTO
   function toggle(m: ModelInfo) {
     const next = new Map(picked);
     if (next.has(m.id)) next.delete(m.id);
-    else next.set(m.id, { modelId: m.id, displayName: m.name ?? null, capabilities: {}, contextLength: m.contextLength ?? null, embeddingDim: null, enabled: true });
+    else next.set(m.id, { modelId: m.id, displayName: typeof m.name === "string" && m.name.trim() ? m.name.trim().slice(0, 200) : null, capabilities: {}, contextLength: m.contextLength ?? null, embeddingDim: null, enabled: true });
     setPicked(next);
   }
 

@@ -31,7 +31,7 @@ function toDTO(r: Row): ProviderDTO {
 
 
 function str(v: unknown, field: string, max = 500): string | undefined {
-  if (v === undefined) return undefined;
+  if (v === undefined || v === null) return undefined;
   if (typeof v !== "string") throw new BadInput(`${field} 必須是字串`);
   if (v.length > max) throw new BadInput(`${field} 過長`);
   return v.trim();
@@ -213,7 +213,7 @@ export function mountProviders(app: Hono<HonoEnv>, deps: AppDeps) {
       for (const [k, v] of Object.entries(m.capabilities ?? {})) if (typeof v === "boolean") caps[k] = v;
       const num = (v: unknown) => (Number.isInteger(v) && (v as number) > 0 ? (v as number) : null);
       return {
-        providerId: row.id, modelId, displayName: str(m.displayName, "displayName", 200) || null, capabilities: caps,
+        providerId: row.id, modelId, displayName: typeof m.displayName === "string" ? m.displayName.trim().slice(0, 200) || null : null, capabilities: caps,
         contextLength: num(m.contextLength), embeddingDim: num(m.embeddingDim), enabled: m.enabled !== false,
       };
     });
