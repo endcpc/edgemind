@@ -4,7 +4,7 @@ import type { AgentEvent } from "../../shared/src/index";
 import { auditLogs, fileVersions, files, messages, runs, toolApprovals } from "../src/db/schema";
 import { parseSse } from "../src/llm";
 import { runJavaScript } from "../src/sandbox/quickjs";
-import { PYTHON_NEEDS_BROWSER, codeRunTool } from "../src/tools/code";
+import { codeRunTool } from "../src/tools/code";
 import { runLiveness } from "../src/routes/chat";
 import { STALE_LEASE_MS } from "../src/agent/store";
 import type { Platform } from "../src/context";
@@ -219,16 +219,26 @@ describe("code_run python (browser-side client tool)", () => {
     expect(toolMsgs(h.llmBodies[1])[0]).toBe("使用者取消了瀏覽器端執行。");
   });
 
-  it("background mode has no browser: clear tool error suggesting javascript / e2b-sandbox", async () => {
+  it("background mode waits for the browser; an item nobody picks up is skipped after the TTL", async () => {
     h.script = [callsReply([{ id: "py3", name: "code_run", args: { language: "python", code: "print(1)" } }]), textReply("改用 JS")];
     const r = await h.chat({ content: "bg python", mode: "background", permissionMode: "full" });
     expect(r.status).toBe(202);
     const c = h.client();
-    for (let i = 0; i < 100 && (await c.get(`/runs/${r.json.runId}`)).body.status !== "completed"; i++) await sleep(20);
+    // a page can still execute it: the run pauses with a client item instead of failing the tool outright
+    let approvals: any[] = [];
+    for (let i = 0; i < 100; i++) {
+      approvals = ((await c.get(`/runs/${r.json.runId}`)).body as any).approvals ?? [];
+      if (approvals.length) break;
+      await sleep(20);
+    }
+    expect(approvals[0]).toMatchObject({ toolName: "code_run", kind: "client" });
+    // nobody executes it (tab closed): after the TTL the supervisor skips it so the run moves on
+    await h.t.database.query(`UPDATE tool_approvals SET created_at = now() - interval '5 minutes' WHERE run_id = $1 AND tool_call_id = 'py3'`, [r.json.runId]);
+    await c.get(`/runs/${r.json.runId}/events?after=0`);
+    for (let i = 0; i < 150 && (await c.get(`/runs/${r.json.runId}`)).body.status !== "completed"; i++) await sleep(20);
     expect((await c.get(`/runs/${r.json.runId}`)).body.status).toBe("completed");
     const res = toolMsgs(h.llmBodies[1])[0];
-    expect(res).toBe(PYTHON_NEEDS_BROWSER);
-    expect(res).toContain("e2b-sandbox");
+    expect(String(res)).toContain("取消");
   });
 });
 

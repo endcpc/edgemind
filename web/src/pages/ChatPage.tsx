@@ -14,7 +14,7 @@ import { Composer } from "@/components/chat/Composer";
 import { AssistantTurn, UserMessage, type LiveState } from "@/components/chat/Messages";
 import { onClientToolDone, runClientTool, type ClientToolOutcome } from "@/lib/clientTools";
 import { api, ApiError } from "@/lib/api";
-import { download, postChat, StreamIdleError } from "@/lib/stream";
+import { download, postChat, streamRun, StreamIdleError } from "@/lib/stream";
 import { latestLeaf, pathTo, toTurns } from "@/lib/tree";
 import { modelLabel, useWorkspace } from "@/lib/workspace";
 import { makeAttach } from "@/lib/attach";
@@ -149,7 +149,7 @@ export function ChatPage() {
       } else {
         // pending / running / stopping, or a background run between invocations: follow its step log
         setLive(emptyLive(ar.id, ar.mode));
-        startPolling(ar.id, ar.lastSeq);
+        startRunStream(ar.id, ar.lastSeq);
       }
     } catch (e) {
       if (shownConv.current !== id) return;
@@ -325,7 +325,7 @@ export function ChatPage() {
           }
           // Still running (or a background run between invocations): keep the streamed text and follow the step log.
           setLive((l) => l ?? emptyLive(runId, r.mode === "background" ? "background" : "stream"));
-          startPolling(runId, 0);
+          startRunStream(runId, 0);
           return;
         }
       } catch {
@@ -363,7 +363,7 @@ export function ChatPage() {
           currentConv = b.conversationId;
           handleEvent({ type: "run", runId: b.runId, conversationId: b.conversationId, userMessageId: b.userMessageId ?? null, status: "pending" }, ctx);
           setLive((l) => ({ ...(l ?? emptyLive(b.runId, "background")), runId: b.runId, mode: "background" }));
-          startPolling(b.runId, 0, ctx.wasNew);
+          startRunStream(b.runId, 0, ctx.wasNew);
           return;
         }
         next = ctx.flags.cont && runId ? { runId, action: "continue" } : null;
@@ -476,6 +476,76 @@ export function ChatPage() {
     tick();
   }
 
+  /**
+   * Watch a run through GET /runs/:id/stream (a 45 s SSE tap that only reads its step log). Generation runs in the
+   * background, so a platform's streaming cap can never cut an answer; the tap reconnects with the last seq it saw.
+   */
+  function startRunStream(runId: string, after = 0, wasNew = false) {
+    stopPolling();
+    const token = { runId, stop: false };
+    pollRef.current = token;
+    setBusy(true);
+    let seq = after;
+    let failures = 0;
+    let conv: string | null = null;
+    const ctx = { pendingUser: undefined, wasNew, flags: { cont: false, status: "", approvals: 0 } as StreamFlags };
+    const loop = async (): Promise<void> => {
+      while (!token.stop) {
+        ctx.flags = { cont: false, status: "", approvals: 0 };
+        try {
+          await streamRun(runId, seq, {
+            onEvent: (e) => {
+              if (e.type === "run") {
+                conv = e.conversationId;
+              } else if (e.type === "live") {
+                // the tap re-reads the generator's text: replace, never append
+                setLive((l) => l && { ...l, text: e.text, reasoning: e.reasoning, reasoningOpen: !e.text && !!e.reasoning, held: false });
+                return;
+              } else if (e.type === "done") {
+                ctx.flags.status = e.status;
+              }
+              handleEvent(e, ctx);
+            },
+            onId: (n) => {
+              seq = n;
+            },
+          });
+          failures = 0;
+        } catch (e) {
+          if (token.stop) return;
+          if (e instanceof ApiError && e.status === 404) {
+            // older server without the tap: fall back to polling
+            startPolling(runId, seq, wasNew);
+            return;
+          }
+          if (++failures >= 3) {
+            startPolling(runId, seq, wasNew);
+            return;
+          }
+        }
+        if (token.stop) return;
+        if (ctx.flags.status === "waiting_approval") {
+          setBusy(false);
+          return;
+        }
+        if (ctx.flags.status === "paused") {
+          token.stop = true;
+          pollRef.current = null;
+          await recoverRun(conv ?? convIdRef.current, runId);
+          return;
+        }
+        if (ctx.flags.status) {
+          token.stop = true;
+          pollRef.current = null;
+          await finishRun(conv ?? convIdRef.current, ctx.flags.status, wasNew);
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    };
+    loop();
+  }
+
   const convIdRef = useRef(convId);
   convIdRef.current = convId;
 
@@ -559,7 +629,7 @@ export function ChatPage() {
     if (liveRef.current?.runId !== runId) return; // another conversation is open; it is resumable from its own page
     setLive((l) => l && { ...l, approvals: l.approvals.filter((x) => x.toolCallId !== toolCallId) });
     if (r.resume) runChat({ runId, action: "continue" });
-    else if (r.status === "paused") startPolling(runId, 0);
+    else if (r.status === "paused") startRunStream(runId, 0);
   };
   useEffect(() => onClientToolDone((runId, id, r) => onClientDone.current(runId, id, r)), []);
 
@@ -572,8 +642,7 @@ export function ChatPage() {
         : await api<{ status: string; remaining: PendingApprovalDTO[]; resume: boolean }>(`/runs/${runId}/approvals`, { method: "POST", body: { toolCallId: a.toolCallId, decision } });
       setLive((l) => l && { ...l, approvals: r.remaining });
       if (r.resume) runChat({ runId, action: "continue" });
-      else if (r.status === "paused" && live?.mode === "background") startPolling(runId, 0);
-      else if (r.status === "paused" || r.status === "pending" || r.status === "running") startPolling(runId, 0);
+      else if (r.status === "paused" || r.status === "pending" || r.status === "running") startRunStream(runId, 0);
     } catch (e) {
       toast.error((e as Error).message);
       if (convId) load(convId);

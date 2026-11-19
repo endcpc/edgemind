@@ -448,6 +448,102 @@ describe("segments, stop, background", () => {
     expect(llmBodies).toHaveLength(1);
   });
 
+  it("alwaysBackground: a new turn is handed to the background driver (202) instead of generating in the request", async () => {
+    let starts = 0;
+    const { chat } = makeClient({ name: "test", alwaysBackground: true, startBackground: async () => { starts++; } });
+    script = [text("好")];
+    const r = await chat({ content: "hi", modelId: modelRowId });
+    expect(r.status).toBe(202);
+    expect(starts).toBe(1);
+    const [row] = await t.database.db.select().from(runs).where(eq(runs.id, r.json.runId));
+    expect(row.mode).toBe("background");
+    expect(row.status).toBe("pending");
+  });
+
+  it("alwaysBackground falls back to a streamed segment when the background function cannot start", async () => {
+    const { chat } = makeClient({ name: "test", alwaysBackground: true, startBackground: async () => { throw new Error("no background functions"); } });
+    script = [text("串流完成")];
+    const r = await chat({ content: "hi", modelId: modelRowId });
+    expect(r.status).toBe(200);
+    expect(last(r.events)).toMatchObject({ type: "done", status: "completed" });
+    const [row] = await t.database.db.select().from(runs).where(eq(runs.id, runIdOf(r.events)));
+    expect(row.mode).toBe("stream");
+  });
+
+  it("alwaysBackground + tap: a turn completes end to end without generating inside the POST request", async () => {
+    const { chat, app } = makeClient({ name: "test", alwaysBackground: true }); // default in-process background driver
+    script = [text("背景完成")];
+    const r = await chat({ content: "hi", modelId: modelRowId });
+    expect(r.status).toBe(202);
+    const runId = r.json.runId as string;
+    const res = await app.request(`http://localhost/api/runs/${runId}/stream?after=0`, { headers: { cookie: [...cookies].map(([k, v]) => `${k}=${v}`).join("; ") } }, env);
+    const evs: any[] = [];
+    for await (const e of parseSse(res.body!)) evs.push(JSON.parse(e.data));
+    expect(evs.some((e) => e.type === "message" && e.message.parts[0].text === "背景完成")).toBe(true);
+    expect(evs[evs.length - 1]).toMatchObject({ type: "done", status: "completed" });
+  });
+
+  it("a background run waits for a browser-side tool instead of failing it", async () => {
+    const { chat, c } = makeClient({ name: "test" }); // default in-process background driver
+    script = [calls([{ id: "p1", name: "code_run", args: { language: "python", code: "print(1)" } }]), text("完成")];
+    const r1 = await chat({ content: "py", modelId: modelRowId, mode: "background", permissionMode: "full" });
+    expect(r1.status).toBe(202);
+    const runId = r1.json.runId as string;
+    let approvals: any[] = [];
+    for (let i = 0; i < 200; i++) {
+      approvals = ((await c.get(`/runs/${runId}`)).body as any).approvals ?? [];
+      if (approvals.length) break;
+      await sleep(30);
+    }
+    expect(approvals[0]).toMatchObject({ toolName: "code_run", kind: "client" });
+    const post = await c.post(`/runs/${runId}/client-results`, { toolCallId: "p1", result: { ok: true, stdout: "1\n", stderr: "", result: null } });
+    expect(post.status).toBe(200);
+    let status = "";
+    for (let i = 0; i < 200 && status !== "completed"; i++) {
+      status = (await c.get(`/runs/${runId}`)).body.status;
+      if (status !== "completed") await sleep(30);
+    }
+    expect(status).toBe("completed");
+    const msgs = await t.database.db.select().from(messages).where(eq(messages.conversationId, r1.json.conversationId));
+    const texts = msgs.filter((m) => m.role === "assistant").flatMap((m) => m.parts.filter((p) => p.type === "text").map((p: any) => p.text));
+    expect(texts).toContain("完成");
+  });
+
+  it("the run tap replays the step log and ends with done", async () => {
+    const { chat, app } = makeClient();
+    script = [text("看得到")];
+    const r1 = await chat({ content: "x", modelId: modelRowId });
+    const runId = runIdOf(r1.events);
+    const res = await app.request(`http://localhost/api/runs/${runId}/stream?after=0`, { headers: { cookie: [...cookies].map(([k, v]) => `${k}=${v}`).join("; ") } }, env);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    const evs: any[] = [];
+    for await (const e of parseSse(res.body!)) evs.push(JSON.parse(e.data));
+    expect(evs[0]).toMatchObject({ type: "run", runId });
+    expect(evs.some((e) => e.type === "message" && e.message.parts[0].text === "看得到")).toBe(true);
+    expect(evs[evs.length - 1]).toMatchObject({ type: "done", status: "completed" });
+  });
+
+  it("the run tap relays the background step's live text", async () => {
+    const { chat, app } = makeClient({ name: "test", startBackground: async () => {} });
+    script = [text("之後")];
+    const r1 = await chat({ content: "live", modelId: modelRowId, mode: "background" });
+    const runId = r1.json.runId as string;
+    await t.database.query(`UPDATE runs SET status = 'running', partial = $2::jsonb, updated_at = now() WHERE id = $1`, [
+      runId,
+      JSON.stringify({ base: 999999, text: "半", reasoning: "" }),
+    ]);
+    const res = await app.request(`http://localhost/api/runs/${runId}/stream?after=0`, { headers: { cookie: [...cookies].map(([k, v]) => `${k}=${v}`).join("; ") } }, env);
+    const evs: any[] = [];
+    const reading = (async () => {
+      for await (const e of parseSse(res.body!)) evs.push(JSON.parse(e.data));
+    })();
+    await sleep(800);
+    await t.database.query(`UPDATE runs SET status = 'completed', finished_at = now() WHERE id = $1`, [runId]);
+    await reading;
+    expect(evs.some((e) => e.type === "live" && e.text === "半")).toBe(true);
+    expect(evs[evs.length - 1]).toMatchObject({ type: "done", status: "completed" });
+  });
+
   it("stop during streaming keeps the partial answer", async () => {
     const { open, c } = makeClient();
     script = [slowText(Array.from({ length: 40 }, (_, i) => `字${i}`), 25)];

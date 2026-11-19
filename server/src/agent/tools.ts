@@ -65,7 +65,8 @@ export interface Tool {
   interactive?: boolean;
   /**
    * Client-side execution for these args (code_run python → Pyodide in the browser): after the permission gate the
-   * run pauses with a `client` pending item; the web app executes it and POSTs the result. Not possible in background mode.
+   * run pauses with a `client` pending item; the web app executes it and POSTs the result. Works in background mode too
+   * while a page is watching; an item nobody picks up is skipped after a few minutes (see CLIENT_TOOL_TTL_MS).
    */
   clientSide?(args: any): boolean;
   /** Builds the args stored for the browser (e.g. resolved file mounts). Default: the call's args. */

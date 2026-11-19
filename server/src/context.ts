@@ -20,6 +20,13 @@ export interface Platform {
    * of being redone in another capped segment (where a long answer would be cut forever).
    */
   backgroundOnDeadline?: boolean;
+  /**
+   * Never generate inside a streamed request: every turn is handed to the background driver and the page watches a
+   * disposable SSE "tap" (GET /runs/:id/stream). For platforms whose streaming cap is shorter than a long model step
+   * (Netlify: 60 s), so generation is never cut, never re-generated and never lost. Falls back to a streamed segment
+   * when starting the background function fails.
+   */
+  alwaysBackground?: boolean;
   /** Time budget of one background drive invocation. */
   background?: { softMs: number; hardMs?: number };
   /**

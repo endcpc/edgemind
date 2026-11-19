@@ -32,6 +32,11 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuid = (v: unknown): v is string => typeof v === "string" && UUID.test(v);
 
 export const DEFAULT_MAX_STEPS = 25;
+/** One SSE tap stays open this long: it must close well before the platform's streaming cap (Netlify: 60 s). */
+const STREAM_TAP_MS = 45_000;
+/** How often the tap re-reads the step log + live partial. */
+const STREAM_TAP_POLL_MS = 500;
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const DEFAULT_SEGMENT = { softMs: 120_000 };
 const DEFAULT_BACKGROUND = { softMs: 13 * 60_000, hardMs: 14 * 60_000 + 30_000 };
 const MAX_INLINE_BYTES = 15 * 1024 * 1024;
@@ -81,7 +86,7 @@ function parseOptions(v: any): RunOptions | undefined {
 }
 
 /** SSE response driven by `work(emit)`; the work keeps running (waitUntil) even if the client disconnects. */
-function sse(c: Ctx, work: (emit: (e: AgentEvent) => void) => Promise<unknown>): Response {
+function sse(c: Ctx, work: (emit: (e: AgentEvent, id?: number) => void, isClosed: () => boolean) => Promise<unknown>): Response {
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
   const writer = writable.getWriter();
   const enc = new TextEncoder();
@@ -92,11 +97,11 @@ function sse(c: Ctx, work: (emit: (e: AgentEvent) => void) => Promise<unknown>):
       closed = true;
     });
   };
-  const emit = (e: AgentEvent) => write(`event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`);
+  const emit = (e: AgentEvent, id?: number) => write(`${id !== undefined ? `id: ${id}\n` : ""}event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`);
   const ka = setInterval(() => write(": keep-alive\n\n"), 15_000);
   const p = (async () => {
     try {
-      await work(emit);
+      await work(emit, () => closed);
     } catch (e) {
       emit({ type: "error", error: { message: (e as Error).message, code: "internal" } });
     } finally {
@@ -134,6 +139,8 @@ export const BACKGROUND_IDLE_MS = 20_000;
 export const MAX_BACKGROUND_RESCUES = 3;
 /** Minimum time between two automatic restarts of the same run. */
 const RESCUE_INTERVAL_MS = 60_000;
+/** A browser-side tool (code_run python) nobody picked up in this long is skipped so the run never waits forever. */
+const CLIENT_TOOL_TTL_MS = 180_000;
 
 /**
  * No background function is executing this background run: its lease went stale (the function died, hit its time limit
@@ -240,8 +247,24 @@ export function mountChat(app: Hono<HonoEnv>, deps: AppDeps): ChatApi {
    * MAX_BACKGROUND_RESCUES times and once per RESCUE_INTERVAL_MS (atomic, so concurrent polls start one invocation).
    */
   async function superviseBackground(c: Ctx, run: { id: string; status: string; mode: string; updatedAt: Date }) {
-    if (!backgroundOrphaned(run)) return;
     const database = c.get("database");
+    // A background run may wait for a browser-side tool (code_run python). With the tab gone it would wait forever:
+    // skip it after the TTL so the model gets an error and the run moves on.
+    if (run.mode === "background" && run.status === "waiting_approval") {
+      const expired = await database.query<{ id: string }>(
+        `UPDATE tool_approvals SET status = 'denied', decided_at = now()
+           WHERE run_id = $1 AND kind = 'client' AND status = 'pending'
+             AND created_at < now() - ($2::int * interval '1 millisecond')
+         RETURNING id`,
+        [run.id, CLIENT_TOOL_TTL_MS],
+      );
+      if (expired.length) {
+        console.warn(`[edgemind] ${expired.length} browser tool(s) of run ${run.id} timed out; skipping them`);
+        if (await transition(database, run.id, ["waiting_approval"], { status: "paused" })) await startBackground(c, run.id);
+      }
+      return;
+    }
+    if (!backgroundOrphaned(run)) return;
     const rows = await database.query<{ rescue_count: number }>(
       `UPDATE runs SET rescue_count = rescue_count + 1, rescued_at = now()
          WHERE id = $1 AND mode = 'background' AND rescue_count < $2
@@ -334,7 +357,10 @@ export function mountChat(app: Hono<HonoEnv>, deps: AppDeps): ChatApi {
     }
 
     // ----- new turn: new message, edit-and-branch, or regenerate -----
-    const mode = body.mode === "background" ? "background" : "stream";
+    // On platforms whose streaming cap is shorter than a long model step, never generate inside the request: the run is
+    // handed to the background driver and the page watches GET /runs/:id/stream.
+    const requested = body.mode === "background" ? "background" : "stream";
+    const mode = requested === "stream" && deps.platform?.alwaysBackground ? "background" : requested;
     let conversationId: string;
     let conv: typeof conversations.$inferSelect | undefined;
     let newConvModel: string | undefined;
@@ -399,8 +425,16 @@ export function mountChat(app: Hono<HonoEnv>, deps: AppDeps): ChatApi {
     await db.update(messages).set({ runId: run.id }).where(and(eq(messages.id, userMessageId), eq(messages.role, "user")));
 
     if (mode === "background") {
-      await startBackground(c, run.id);
-      return c.json({ runId: run.id, conversationId, userMessageId, status: "pending" }, 202);
+      try {
+        await startBackground(c, run.id);
+      } catch (e) {
+        // No background function on this platform / plan: run this turn as a streamed segment instead of stranding it.
+        console.error("[edgemind] background start failed; falling back to a streamed segment", e);
+        await db.update(runs).set({ mode: "stream" }).where(eq(runs.id, run.id));
+        const env = agentEnv(c);
+        return sse(c, (emit) => runSegment(env, run.id, { ...segmentOpts(t0), emit }));
+      }
+      return c.json({ runId: run.id, conversationId, userMessageId, status: "pending", mode: "background" }, 202);
     }
     const env = agentEnv(c);
     return sse(c, (emit) => runSegment(env, run.id, { ...segmentOpts(t0), emit }));
@@ -443,6 +477,72 @@ export function mountChat(app: Hono<HonoEnv>, deps: AppDeps): ChatApi {
       steps: steps.map((s) => ({ seq: s.seq, kind: s.kind, payload: s.payload, createdAt: s.createdAt.toISOString() })),
       nextAfter,
       partial,
+    });
+  });
+
+  /**
+   * GET /runs/:id/stream?after=N — a disposable tap on a run's step log (SSE). It never generates anything: it reads
+   * run_steps + runs.partial and closes after ~45 s, so it fits any platform's streaming cap. The page reconnects with
+   * `after=<last id it saw>`; a step is therefore delivered exactly once per connection and never re-generated.
+   */
+  app.get("/runs/:id/stream", async (c) => {
+    const id = c.req.param("id");
+    if (!isUuid(id)) return c.json({ error: "not_found" }, 404);
+    const after = Math.max(0, Number(c.req.query("after") ?? 0) || 0);
+    const first = await getRun(c.get("database"), id);
+    if (!first) return c.json({ error: "not_found", message: "找不到執行紀錄" }, 404);
+    return sse(c, async (emit, isClosed) => {
+      let run = first;
+      let seq = after;
+      emit({ type: "run", runId: id, conversationId: run.conversationId, userMessageId: run.userMessageId, status: run.status as RunStatus });
+      const started = Date.now();
+      let approvalsSent = false;
+      let lastSupervise = 0;
+      while (!isClosed() && Date.now() - started < STREAM_TAP_MS) {
+        const fresh = await getRun(c.get("database"), id);
+        if (fresh) run = fresh;
+        // A background function that died is restarted here too: the tap is often the only thing watching the run.
+        if (run.mode === "background" && backgroundOrphaned(run) && Date.now() - lastSupervise > 5_000) {
+          lastSupervise = Date.now();
+          await superviseBackground(c, run).catch((e) => console.error("[edgemind] supervise failed", e));
+        }
+        const rows = await c.get("database").db.select().from(runSteps)
+          .where(and(eq(runSteps.runId, id), gt(runSteps.seq, seq))).orderBy(asc(runSteps.seq)).limit(200);
+        for (const row of rows) {
+          seq = row.seq;
+          const pl = row.payload as any;
+          if (row.kind === "message" && pl?.message) emit({ type: "message", message: pl.message }, row.seq);
+          else if (row.kind === "tool_result") emit({ type: "tool-result", callId: pl?.callId, name: pl?.name, result: pl?.result, isError: pl?.isError }, row.seq);
+          else if (row.kind === "error") emit({ type: "error", error: pl?.error ?? { message: String(pl?.message ?? "執行失敗"), code: "internal" } }, row.seq);
+        }
+        if (run.status === "running") {
+          const p = run.partial as RunPartial | null;
+          if (p && p.base >= seq && (p.text || p.reasoning)) emit({ type: "live", text: p.text, reasoning: p.reasoning });
+        }
+        if (run.status === "waiting_approval") {
+          if (!approvalsSent) {
+            approvalsSent = true;
+            emit({ type: "approval-required", approvals: await pendingApprovals(c.get("database"), id, registry) });
+          }
+          emit({ type: "done", status: "waiting_approval" });
+          return;
+        }
+        if (run.status === "paused" && run.mode !== "background") {
+          // a streamed segment ended: the page decides whether to continue (202/stream fallback)
+          emit({ type: "done", status: "paused", reason: "paused" });
+          return;
+        }
+        if (runLiveness(run).resumable) {
+          // nothing is executing it any more (restart limit reached): offer 繼續執行 instead of reconnecting forever
+          emit({ type: "done", status: "paused", reason: "resumable" });
+          return;
+        }
+        if (TERMINAL_RUN_STATUSES.includes(run.status as RunStatus)) {
+          emit({ type: "done", status: run.status as RunStatus, reason: ((run.checkpoint as Checkpoint | null)?.finishReason) ?? undefined });
+          return;
+        }
+        await sleep(STREAM_TAP_POLL_MS);
+      }
     });
   });
 

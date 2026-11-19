@@ -404,7 +404,6 @@ async function segmentBody(
         };
         const prior = await recordedResult(call.id);
         if (prior) return finish(prior.result, !!prior.isError, "reused");
-        if (run.mode === "background") return finish(tool.clientUnavailable ?? "此工具需要開啟中的瀏覽器分頁，背景模式無法執行。", true, decision);
         const [cl] = await db.db.select().from(toolApprovals).where(and(eq(toolApprovals.runId, runId), eq(toolApprovals.toolCallId, call.id), eq(toolApprovals.kind, "client"))).limit(1);
         if (!cl) {
           let clientArgs: unknown;
@@ -726,7 +725,7 @@ function reasoningOf(parts: Part[]): string {
 }
 
 /** Interval between writes of a background step's live text (one write in flight at most). */
-export const PARTIAL_FLUSH_MS = 1000;
+export const PARTIAL_FLUSH_MS = 400;
 
 /**
  * Throttled writer of `runs.partial` for one model step. Text and reasoning accumulate in memory and are written at most

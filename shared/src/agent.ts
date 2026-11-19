@@ -65,5 +65,7 @@ export type AgentEvent =
    * platform's hard limit and will be regenerated from its start: the client must replace that text, never append.
    */
   | { type: "continue"; runId: string; mode?: "stream" | "background"; reason?: "budget" | "deadline" | "deadline_limit"; attempt?: number }
+  /** Reader-only: live text of the step being generated (GET /runs/:id/stream). Always replaces, never appends. */
+  | { type: "live"; text: string; reasoning: string }
   | { type: "done"; status: RunStatus; reason?: string }
   | { type: "error"; error: LlmErrorInfo };
