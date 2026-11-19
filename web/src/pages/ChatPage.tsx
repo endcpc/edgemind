@@ -45,9 +45,6 @@ interface ActiveRunDTO {
 
 type Effort = "" | "low" | "medium" | "high";
 
-/** Step-log polling interval (background mode shows the step's live text at this pace). */
-const POLL_MS = 1000;
-
 const emptyLive = (runId: string | null, mode: LiveState["mode"]): LiveState => ({
   runId, mode, text: "", reasoning: "", reasoningOpen: false, calls: [], results: {}, approvals: [], status: "running",
 });
@@ -82,20 +79,6 @@ export function ChatPage() {
   const bottomRef = useRef<HTMLDivElement>(null);
   const scroller = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
-  /**
-   * Automatic 繼續執行 after a stream dropped without its terminal event (platform time limit, flaky network): the run is
-   * continued from this page up to `left` times before the button is shown. Reset on every new turn.
-   */
-  const autoResume = useRef<{ runId: string; left: number } | null>(null);
-  const runChatRef = useRef<(body: Record<string, unknown>) => void>(() => {});
-  /** Continue `runId` automatically if this page still has retries for it; false → show 繼續執行. */
-  const tryAutoResume = (runId: string): boolean => {
-    const a = autoResume.current;
-    if (!a || a.runId !== runId || a.left <= 0) return false;
-    a.left--;
-    setTimeout(() => runChatRef.current({ runId, action: "continue" }), 0);
-    return true;
-  };
 
   const projectId = meta?.projectId ?? search.get("project");
   const project = ws.projects.find((p) => p.id === projectId) ?? null;
@@ -142,9 +125,9 @@ export function ChatPage() {
         // approvals / questions show their cards; browser-side items (code_run python) are started by the effect below
         setLive({ ...emptyLive(ar.id, ar.mode), approvals: ar.approvals, status: ar.status });
       } else if (ar.resumable || (ar.status === "paused" && ar.mode !== "background")) {
-        // nothing is executing it: continue it automatically after a dropped stream, else offer 繼續執行
+        // nothing is executing it: offer 繼續執行 instead of spinning forever
         setLive(null);
-        if (!tryAutoResume(ar.id)) setPausedRun(ar.id);
+        setPausedRun(ar.id);
       } else {
         // pending / running / stopping, or a background run between invocations: follow its step log
         setLive(emptyLive(ar.id, ar.mode));
@@ -266,7 +249,7 @@ export function ChatPage() {
         break;
       case "message":
         addMessage(e.message);
-        setLive((l) => l && { ...l, text: "", reasoning: "", reasoningOpen: false, held: false, calls: [] });
+        setLive((l) => l && { ...l, text: "", reasoning: "", reasoningOpen: false, calls: [] });
         break;
       case "tool-result":
         setLive((l) => l && { ...l, results: { ...l.results, [e.callId]: { result: e.result, isError: e.isError } } });
@@ -277,13 +260,6 @@ export function ChatPage() {
         break;
       case "continue":
         ctx.flags.cont = true;
-        if (e.mode === "background") {
-          // The step goes on in background mode: keep what was streamed until the background step's live text catches up.
-          setLive((l) => l && { ...l, held: !!(l.text || l.reasoning), reasoningOpen: false });
-          break;
-        }
-        // The next segment re-streams an interrupted step from its start: drop the partial text so it isn't doubled.
-        setLive((l) => l && { ...l, text: "", reasoning: "", reasoningOpen: false, held: false, calls: l.calls.filter((c) => c.ended && l.results[c.id]) });
         break;
       case "done":
         ctx.flags.status = e.status;
@@ -302,8 +278,6 @@ export function ChatPage() {
     setLive((l) => (l && l.approvals.length ? { ...l, error: undefined } : emptyLive(null, body.mode === "background" ? "background" : "stream")));
     const ctx = { pendingUser: opts.pendingUser, wasNew: !!opts.wasNew, flags: { cont: false, status: "", approvals: 0 } as StreamFlags };
     let currentConv = convId;
-    let lastRunId: string | null = typeof body.runId === "string" ? body.runId : null;
-    if (body.action !== "continue") autoResume.current = null; // a new turn starts with fresh retries
     try {
       let next: Record<string, unknown> | null = body;
       while (next) {
@@ -312,7 +286,6 @@ export function ChatPage() {
         const res = await postChat(next, (e) => {
           if (e.type === "run") {
             runId = e.runId;
-            lastRunId = e.runId;
             currentConv = e.conversationId;
           }
           handleEvent(e, ctx);
@@ -333,9 +306,8 @@ export function ChatPage() {
         // items it waits on. Never assume "completed": the run may be waiting for this tab (e.g. code_run python), paused,
         // or still running. Re-read the real state from the server.
         setBusy(false);
-        if (lastRunId && autoResume.current?.runId !== lastRunId) autoResume.current = { runId: lastRunId, left: 3 };
         if (currentConv) {
-          toast.message("連線中斷，正在接續執行");
+          toast.message("連線中斷，已重新載入執行狀態");
           await load(currentConv);
         } else setLive(null);
         await ws.refreshConversations().catch(() => {});
@@ -351,7 +323,6 @@ export function ChatPage() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [convId, projectId, draftMode, finishRun, load]);
-  runChatRef.current = runChat;
 
   /** Background mode / reload: poll the run's step log. */
   function startPolling(runId: string, after: number, wasNew = false) {
@@ -364,34 +335,20 @@ export function ChatPage() {
     const tick = async () => {
       if (token.stop) return;
       try {
-        const r = await api<{
-          status: string; mode?: string; stale?: boolean; resumable?: boolean;
-          steps: { seq: number; kind: string; payload: any }[]; nextAfter: number;
-          /** live text of the background step being generated (null between steps) */
-          partial?: { text: string; reasoning: string } | null;
-        }>(`/runs/${runId}/events?after=${seq}`);
+        const r = await api<{ status: string; mode?: string; stale?: boolean; resumable?: boolean; steps: { seq: number; kind: string; payload: any }[]; nextAfter: number }>(`/runs/${runId}/events?after=${seq}`);
         if (token.stop) return;
         let needApprovals = false;
         for (const s of r.steps) {
           if (s.kind === "message") {
             addMessage(s.payload.message);
             conv = s.payload.message.conversationId ?? conv;
-            setLive((l) => l && { ...l, text: "", reasoning: "", reasoningOpen: false, held: false, calls: [] });
+            setLive((l) => l && { ...l, calls: [] });
           } else if (s.kind === "tool_result") {
             setLive((l) => l && { ...l, results: { ...l.results, [s.payload.callId]: { result: s.payload.result, isError: s.payload.isError } } });
           } else if (s.kind === "approval") needApprovals = true;
           else if (s.kind === "error") setLive((l) => l && { ...l, error: s.payload?.error?.message ?? s.payload?.message ?? "執行失敗" });
         }
         seq = r.nextAfter;
-        const p = r.partial;
-        if (p && (p.text || p.reasoning)) {
-          setLive((l) => {
-            if (!l) return l;
-            // still behind the text streamed before the switch to background mode: keep showing that
-            if (l.held && p.text.length + p.reasoning.length < l.text.length + l.reasoning.length) return l;
-            return { ...l, text: p.text, reasoning: p.reasoning, reasoningOpen: !p.text && !!p.reasoning, held: false };
-          });
-        }
         if (needApprovals || r.status === "waiting_approval") {
           const run = await api<{ approvals: PendingApprovalDTO[] }>(`/runs/${runId}`);
           setLive((l) => l && { ...l, approvals: run.approvals });
@@ -410,13 +367,12 @@ export function ChatPage() {
           return;
         }
         if (r.resumable) {
-          // paused between segments (stream mode) or abandoned by a segment that died: continue it automatically
-          // after a dropped stream (limited retries), otherwise only 繼續執行 moves it on
+          // paused between segments (stream mode) or abandoned by a segment that died: only 繼續執行 moves it on
           token.stop = true;
           pollRef.current = null;
           setBusy(false);
           setLive((l) => (l && l.error ? { ...l, runId: null } : null));
-          if (!tryAutoResume(runId)) setPausedRun(runId);
+          setPausedRun(runId);
           return;
         }
         if (r.status === "stopping" && r.stale) {
@@ -426,7 +382,7 @@ export function ChatPage() {
       } catch {
         /* transient: retry */
       }
-      setTimeout(tick, POLL_MS);
+      setTimeout(tick, 1500);
     };
     tick();
   }

@@ -25,7 +25,7 @@ import { buildMcpTools, mcpRisks } from "../mcp/service";
 import { estimateTokens, getMemorySettings, helperModel, maybeCompact, memoryRecaller, messageTokens } from "../memory";
 import { evaluate, loadGrants, loadPolicies, resolveMode, type Policy } from "./permissions";
 import {
-  appendStep, claimRun, getRun, heartbeat, insertMessage, lastStepSeq, saveRun, setPartial, toMessageDTO, transition, STALE_LEASE_MS,
+  appendStep, claimRun, getRun, heartbeat, insertMessage, saveRun, toMessageDTO, transition, STALE_LEASE_MS,
   type Checkpoint, type PendingTools, type RunRow,
 } from "./store";
 import { ToolDeferred, type Tool, type ToolContext, type ToolRegistry } from "./tools";
@@ -62,16 +62,7 @@ export interface SegmentBudget {
 
 export interface SegmentOptions extends SegmentBudget {
   emit?: (e: AgentEvent) => void;
-  /**
-   * Stream-mode runs on platforms with a hard wall-clock cap (Netlify ≈60 s): when a model step is cut by the hard
-   * deadline, switch the run to background mode instead of redoing the same step in another capped segment, where a
-   * long answer would be cut again forever. The client's `continue` then gets 202 and follows the step log.
-   */
-  backgroundOnDeadline?: boolean;
 }
-
-/** A model step only starts when at least this much of the hard deadline is left (else pause first, fresh segment). */
-export const MIN_MODEL_STEP_MS = 30_000;
 
 export interface SegmentOutcome {
   status: RunStatus;
@@ -352,8 +343,6 @@ async function segmentBody(
   };
 
   let modelStepsThisSegment = 0;
-  /** Something was persisted in this segment (a model step or a batch of tool results): pausing now still advances. */
-  let progressed = false;
   const fileCache = new Map<string, Part>();
   let lastInputTokens = 0;
   const memSettings = await getMemorySettings(db);
@@ -538,18 +527,12 @@ async function segmentBody(
       cp.leafId = row.id;
       cp.pending = undefined;
       await saveCp();
-      progressed = true;
     }
 
     // ---------- 2. limits ----------
     if (stepCount >= run.maxSteps) return finalize("completed", "max_steps");
     if (modelStepsThisSegment > 0 && elapsed() >= opts.softMs) return pause("budget");
     if (deadlineSignal.aborted) return pause("deadline");
-    // Don't start a model step that the hard deadline would cut mid-stream (its output would be thrown away and
-    // regenerated): hand it a fresh segment instead. Only after progress, so a segment always moves the run forward.
-    if (deadline !== undefined && progressed && deadline - Date.now() < Math.min(MIN_MODEL_STEP_MS, (opts.hardMs ?? 0) * 0.6)) {
-      return pause("budget");
-    }
     if (fullCaps) {
       if (fullCaps.maxSteps && stepCount >= fullCaps.maxSteps) return finalize("completed", "full_mode_step_cap");
       if (fullCaps.maxTokens || fullCaps.maxCostUsd) {
@@ -611,19 +594,11 @@ async function segmentBody(
       ...(cp.options?.reasoning ? { reasoning: cp.options.reasoning } : {}),
     };
     const b = new AssistantBuilder();
-    // Background mode has no SSE consumer: publish the step's text as it is generated so polling pages show it live.
-    const live = run.mode === "background" ? partialWriter(db, runId, await lastStepSeq(db, runId).catch(() => 0)) : null;
-    try {
-      for await (const ev of streamChat(model.cfg, req, { signal: workSignal })) {
-        b.push(ev);
-        live?.push(ev);
-        if (ev.type !== "finish" && ev.type !== "error") emit(ev);
-      }
-    } finally {
-      await live?.stop();
+    for await (const ev of streamChat(model.cfg, req, { signal: workSignal })) {
+      b.push(ev);
+      if (ev.type !== "finish" && ev.type !== "error") emit(ev);
     }
     modelStepsThisSegment++;
-    if (!b.error) progressed = true;
 
     if (b.error?.code === "aborted") {
       if (stopSignal.aborted) {
@@ -634,14 +609,6 @@ async function segmentBody(
           emit({ type: "message", message: toMessageDTO(row) });
         }
         return finalizeStopped();
-      }
-      if (opts.backgroundOnDeadline && run.mode === "stream") {
-        // The step alone outlasts a capped segment: finish it in background mode (long budget) instead of looping.
-        const ok = await transition(db, runId, ["running"], { status: "paused", mode: "background", checkpoint: cp, stepCount });
-        if (!ok) return finalizeStopped();
-        await appendStep(db, runId, "continue", { reason: "deadline", mode: "background" });
-        emit({ type: "continue", runId, mode: "background" });
-        return { status: "paused", reason: "deadline_background" };
       }
       return pause("deadline"); // step is redone next segment
     }
@@ -669,7 +636,6 @@ async function segmentBody(
     const row = await insertMessage(db, { conversationId, parentId: cp.leafId, role: "assistant", parts: msg.parts, runId, modelId: model.modelRowId });
     const dto = toMessageDTO(row);
     await appendStep(db, runId, "message", { message: dto, finish: b.finish, usage: b.usage });
-    if (live) await setPartial(db, runId, null).catch(() => {}); // the message step supersedes it
     emit({ type: "message", message: dto });
     cp.leafId = row.id;
 
@@ -682,47 +648,6 @@ async function segmentBody(
     }
     return finalize("completed", b.finish ?? "stop");
   }
-}
-
-/** Interval between writes of a background step's live text (one write in flight at most). */
-export const PARTIAL_FLUSH_MS = 1000;
-
-/**
- * Throttled writer of `runs.partial` for one model step. Text and reasoning accumulate in memory and are written at most
- * every PARTIAL_FLUSH_MS; `stop()` flushes what is left. A step that is cut and redone simply starts a new partial.
- */
-function partialWriter(db: AgentEnv["database"], runId: string, base: number) {
-  let text = "";
-  let reasoning = "";
-  let dirty = false;
-  let inflight: Promise<void> | null = null;
-  const flush = () => {
-    if (!dirty || inflight) return;
-    dirty = false;
-    inflight = setPartial(db, runId, { base, text, reasoning })
-      .catch(() => {})
-      .finally(() => {
-        inflight = null;
-      });
-  };
-  const timer = setInterval(flush, PARTIAL_FLUSH_MS);
-  return {
-    push(ev: { type: string; text?: string }) {
-      if (ev.type === "text-delta" && ev.text) {
-        text += ev.text;
-        dirty = true;
-      } else if (ev.type === "reasoning-delta" && ev.text) {
-        reasoning += ev.text;
-        dirty = true;
-      }
-    },
-    async stop() {
-      clearInterval(timer);
-      if (inflight) await inflight;
-      flush();
-      if (inflight) await inflight;
-    },
-  };
 }
 
 /**

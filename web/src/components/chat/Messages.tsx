@@ -25,11 +25,6 @@ export interface LiveState {
   approvals: PendingApprovalDTO[];
   status: string;
   error?: string;
-  /**
-   * The text shown is the stream of a step that was cut and is being regenerated in background mode: keep it until the
-   * background step's own live text catches up (or its message lands), so the answer doesn't vanish meanwhile.
-   */
-  held?: boolean;
 }
 
 const textOfParts = (parts: Part[]) => parts.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("\n\n");
