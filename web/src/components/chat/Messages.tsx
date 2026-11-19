@@ -25,6 +25,13 @@ export interface LiveState {
   approvals: PendingApprovalDTO[];
   status: string;
   error?: string;
+  /**
+   * The text shown is the stream of a step that was cut and is being regenerated in background mode: keep it until the
+   * background step's own live text catches up (or its message lands), so the answer doesn't vanish meanwhile.
+   */
+  held?: boolean;
+  /** The step was cut by the platform's hard limit and is being retried (1-based). */
+  attempt?: number;
 }
 
 const textOfParts = (parts: Part[]) => parts.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("\n\n");
@@ -155,6 +162,11 @@ export function AssistantTurn(props: {
       )}
       {showLive && (
         <div>
+          {live.attempt ? (
+            <div className="my-2 rounded-lg border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400">
+              回覆超過這一階段的時限,正在重新生成(第 {live.attempt} 次);上一次的內容不會保留。
+            </div>
+          ) : null}
           {live.reasoning && <Reasoning text={live.reasoning} live={live.reasoningOpen} />}
           {live.text && <Markdown text={live.text} streaming />}
           {live.calls.map((c) => (
