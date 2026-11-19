@@ -35,6 +35,7 @@ const app = createApp({
   platform: {
     name: "cloudflare",
     segment: { softMs: 50_000 },
+    minStepMs: 15_000,
     background: { softMs: 20_000, hardMs: 27_000 },
     async startBackground({ origin, runId, token }) {
       const res = await fetch(`${origin}/api/internal/runs/${encodeURIComponent(runId)}/drive`, { method: "POST", headers: { "x-edgemind-drive": token } });

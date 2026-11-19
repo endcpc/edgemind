@@ -24,7 +24,9 @@ useNodeQuickJS();
 /** Must match maxDuration written by scripts/build-vercel.mjs (EDGEMIND_MAX_DURATION, default 300). */
 const MAX_S = Math.max(60, Number(process.env.EDGEMIND_MAX_DURATION) || 300);
 /** Leave a margin for persisting the step log and handing over to the next invocation. */
-const budget = { softMs: (MAX_S - 60) * 1000, hardMs: (MAX_S - 30) * 1000 };
+const budget = { softMs: (MAX_S - 80) * 1000, hardMs: (MAX_S - 45) * 1000 };
+/** A model step cut by the hard deadline finishes in background mode (same maxDuration, chained) instead of being redone. */
+const MIN_STEP_MS = 60_000;
 
 function readEnv(): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -55,6 +57,8 @@ const platform: Platform = {
   name: "vercel",
   segment: budget,
   background: budget,
+  minStepMs: MIN_STEP_MS,
+  backgroundOnDeadline: true, // a step longer than one capped segment keeps going in background mode (chained)
   async startBackground({ origin, runId, token }) {
     const res = await fetch(`${origin}/api/internal/runs/${encodeURIComponent(runId)}/drive`, { method: "POST", headers: selfHeaders(token) });
     if (res.status >= 400) throw new Error(`無法啟動背景執行（HTTP ${res.status}）`);

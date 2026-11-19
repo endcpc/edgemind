@@ -1,6 +1,6 @@
 /**
  * Netlify Functions (v2, Web-standard Request/Response) adapter.
- * Sync + streaming functions are capped at 60s; background functions (15 min) get their own entry later.
+ * Streaming functions are capped at 60 s from the request; background functions (15 min) get their own entry.
  */
 import { createApp } from "../app";
 import { createNeonDatabase } from "../db/client";
@@ -49,7 +49,7 @@ const startInternal: NonNullable<Platform["startInternal"]> = async ({ origin, p
 
 const app = createApp({
   getDatabase: (env) => createNeonDatabase(env.DATABASE_URL),
-  platform: { name: "netlify", segment: { softMs: 50_000, hardMs: 57_000 }, startBackground, startInternal },
+  platform: { name: "netlify", segment: { softMs: 34_000, hardMs: 42_000 }, minStepMs: 18_000, backgroundOnDeadline: true, startBackground, startInternal },
 });
 
 /** Same app, configured to drive runs inline with the background-function budget. */

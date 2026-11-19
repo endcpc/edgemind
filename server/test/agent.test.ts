@@ -6,6 +6,8 @@ import { createApp } from "../src/app";
 import { auditLogs, messages, runs, toolApprovals, usageLogs } from "../src/db/schema";
 import { parseSse } from "../src/llm";
 import { builtinRegistry, type Tool } from "../src/agent/tools";
+import { MAX_DEADLINE_RETRIES, runSegment, type AgentEnv } from "../src/agent/loop";
+import { decodeKey32 } from "../src/env";
 import { createTestDatabase, testEnv, TestClient } from "./helpers";
 import { sseResponse } from "./llm-helpers";
 
@@ -300,7 +302,7 @@ describe("segments, stop, background", () => {
     const runId = runIdOf(r.events);
     let segments = 1;
     while (last(r.events).type === "continue") {
-      expect(last(r.events)).toEqual({ type: "continue", runId });
+      expect(last(r.events)).toMatchObject({ type: "continue", runId, reason: "budget" });
       r = await chat({ runId, action: "continue" });
       segments++;
       expect(segments).toBeLessThan(10);
@@ -321,6 +323,129 @@ describe("segments, stop, background", () => {
     expect(last(r2.events)).toMatchObject({ status: "completed" });
     const msgs = await t.database.db.select().from(messages).where(eq(messages.conversationId, convOf(r1.events)));
     expect(msgs.filter((m) => m.role === "assistant").map((m) => m.parts)).toEqual([[{ type: "text", text: "快" }]]);
+  });
+
+  it("backgroundOnDeadline: a model step cut by the hard deadline moves the run to background instead of redoing it", async () => {
+    const { chat, c } = makeClient({ name: "test", segment: { softMs: 0, hardMs: 120 }, background: { softMs: 60_000 }, backgroundOnDeadline: true });
+    script = [slowText(["慢", "慢", "慢", "慢"], 60), text("完成")];
+    const r1 = await chat({ content: "長回答", modelId: modelRowId });
+    const runId = runIdOf(r1.events);
+    expect(last(r1.events)).toMatchObject({ type: "continue", runId, reason: "deadline", mode: "background" });
+    const [row] = await t.database.db.select().from(runs).where(eq(runs.id, runId));
+    expect(row.mode).toBe("background");
+    expect(row.status).toBe("paused");
+    // the page's automatic `continue` is answered with 202: the step finishes in background mode
+    const r2 = await chat({ runId, action: "continue" });
+    expect(r2.status).toBe(202);
+    let status = "";
+    for (let i = 0; i < 100 && status !== "completed"; i++) {
+      status = (await c.get(`/runs/${runId}`)).body.status;
+      if (status !== "completed") await sleep(30);
+    }
+    expect(status).toBe("completed");
+    const msgs = await t.database.db.select().from(messages).where(eq(messages.conversationId, convOf(r1.events)));
+    // the cut attempt is not persisted: the answer appears exactly once
+    expect(msgs.filter((m) => m.role === "assistant").map((m) => m.parts)).toEqual([[{ type: "text", text: "完成" }]]);
+    const [after] = await t.database.db.select().from(runs).where(eq(runs.id, runId));
+    expect(after.partial).toBeNull();
+  });
+
+  it("background mode publishes the step's live text for polling pages, cleared once its message lands", async () => {
+    const { chat, c } = makeClient();
+    script = [slowText(Array.from({ length: 30 }, (_, i) => `字${i}`), 100)];
+    const r1 = await chat({ content: "背景長回答", modelId: modelRowId, mode: "background" });
+    expect(r1.status).toBe(202);
+    const runId = r1.json.runId as string;
+    let seen = "";
+    let first = "";
+    let status = "";
+    for (let i = 0; i < 200 && status !== "completed"; i++) {
+      const r = (await c.get(`/runs/${runId}/events?after=0`)).body;
+      status = r.status;
+      if (r.partial?.text) {
+        seen = r.partial.text;
+        first ||= r.partial.text;
+      }
+      if (status === "completed") expect(r.partial).toBeNull();
+      else await sleep(50);
+    }
+    expect(status).toBe("completed");
+    expect(seen.startsWith("字0字1")).toBe(true);
+    expect(first.length).toBeLessThan(Array.from({ length: 30 }, (_, i) => `字${i}`).join("").length);
+    const [row] = await t.database.db.select().from(runs).where(eq(runs.id, runId));
+    expect(row.partial).toBeNull();
+  });
+
+  it("an orphaned background run is restarted by polling, then offered as 繼續執行 after the restart limit", async () => {
+    let starts = 0;
+    const { chat, c } = makeClient({ name: "test", startBackground: async () => { starts++; } }); // chain lost: nothing drives it
+    script = [text("好")];
+    const r1 = await chat({ content: "背景", modelId: modelRowId, mode: "background" });
+    const runId = r1.json.runId as string;
+    expect(starts).toBe(1);
+    const age = (sec: number) => t.database.query(`UPDATE runs SET updated_at = now() - ($2::int * interval '1 second'), rescued_at = CASE WHEN rescued_at IS NULL THEN NULL ELSE now() - interval '2 minutes' END WHERE id = $1`, [runId, sec]);
+    // still fresh: not touched
+    expect((await c.get(`/runs/${runId}/events?after=0`)).body.resumable).toBe(false);
+    expect(starts).toBe(1);
+    for (let k = 1; k <= 3; k++) {
+      await age(30);
+      const r = (await c.get(`/runs/${runId}/events?after=0`)).body;
+      expect(starts).toBe(1 + k);
+      expect(r.resumable).toBe(false);
+      await c.get(`/runs/${runId}/events?after=0`); // concurrent / next poll inside the interval: no second start
+      expect(starts).toBe(1 + k);
+    }
+    await age(30);
+    const r = (await c.get(`/runs/${runId}/events?after=0`)).body;
+    expect(starts).toBe(4);
+    expect(r.resumable).toBe(true);
+    // 繼續執行: fresh restarts and a new invocation
+    const r2 = await chat({ runId, action: "continue" });
+    expect(r2.status).toBe(202);
+    expect(starts).toBe(5);
+    const [row] = await t.database.db.select().from(runs).where(eq(runs.id, runId));
+    expect(row.rescueCount).toBe(0);
+    script = [];
+  });
+
+  it("without a background fallback, a step that never fits fails after MAX_DEADLINE_RETRIES instead of looping", async () => {
+    const { chat } = makeClient({ name: "test", segment: { softMs: 0, hardMs: 120 } });
+    script = Array.from({ length: 6 }, () => slowText(["慢", "慢", "慢", "慢"], 60));
+    let r = await chat({ content: "永遠太長", modelId: modelRowId });
+    let rounds = 0;
+    while (last(r.events).type === "continue" && rounds < 10) {
+      expect(last(r.events)).toMatchObject({ type: "continue", reason: "deadline", attempt: rounds + 1 });
+      r = await chat({ runId: runIdOf(r.events), action: "continue" });
+      rounds++;
+    }
+    expect(rounds).toBe(MAX_DEADLINE_RETRIES - 1);
+    expect(last(r.events)).toMatchObject({ type: "done", status: "failed", reason: "deadline_limit" });
+    expect(llmBodies).toHaveLength(MAX_DEADLINE_RETRIES);
+    const msgs = await t.database.db.select().from(messages).where(eq(messages.conversationId, convOf(r.events)));
+    expect(msgs.filter((m) => m.role === "assistant")).toHaveLength(0);
+  });
+
+  it("the segment budget counts from the request, not from runSegment", async () => {
+    const { chat } = makeClient({ name: "test", segment: { softMs: 1_000, hardMs: 2_000 }, startBackground: async () => {} });
+    script = [text("不該被呼叫")];
+    const r1 = await chat({ content: "budget", modelId: modelRowId, mode: "background" });
+    const runId = r1.json.runId as string;
+    // 9 of the 10 seconds were spent before the segment started (auth / migrations / run creation on a cold isolate)
+    const env: AgentEnv = {
+      database: t.database,
+      encKey: decodeKey32(testEnv(t.url).ENCRYPTION_KEY)!,
+      registry: builtinRegistry(),
+      fetch: mockFetch,
+      heartbeatMs: 40,
+      llmRetry: { maxRetries: 0 },
+    };
+    script = [slowText(["慢", "慢", "慢", "慢"], 2_000)];
+    const t0 = Date.now();
+    const out = await runSegment(env, runId, { softMs: 10_000, hardMs: 10_000, startedAt: Date.now() - 9_000 });
+    // only ~1 s of the 10 s cap was left when the segment started, so the step is cut almost immediately
+    expect(out).toMatchObject({ status: "paused", reason: "deadline" });
+    expect(Date.now() - t0).toBeLessThan(3_000);
+    expect(llmBodies).toHaveLength(1);
   });
 
   it("stop during streaming keeps the partial answer", async () => {

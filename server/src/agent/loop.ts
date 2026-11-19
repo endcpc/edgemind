@@ -25,7 +25,7 @@ import { buildMcpTools, mcpRisks } from "../mcp/service";
 import { estimateTokens, getMemorySettings, helperModel, maybeCompact, memoryRecaller, messageTokens } from "../memory";
 import { evaluate, loadGrants, loadPolicies, resolveMode, type Policy } from "./permissions";
 import {
-  appendStep, claimRun, getRun, heartbeat, insertMessage, saveRun, toMessageDTO, transition, STALE_LEASE_MS,
+  appendStep, claimRun, getRun, heartbeat, insertMessage, lastStepSeq, saveRun, setPartial, toMessageDTO, transition, STALE_LEASE_MS,
   type Checkpoint, type PendingTools, type RunRow,
 } from "./store";
 import { ToolDeferred, type Tool, type ToolContext, type ToolRegistry } from "./tools";
@@ -62,7 +62,25 @@ export interface SegmentBudget {
 
 export interface SegmentOptions extends SegmentBudget {
   emit?: (e: AgentEvent) => void;
+  /**
+   * Request arrival time (ms). The platform's wall-clock cap counts from the request, not from this function: auth,
+   * migrations, skill installs and run creation all happen first, so the deadline must be measured from here.
+   */
+  startedAt?: number;
+  /**
+   * Platforms with a hard wall-clock cap (Netlify ≈60 s): when a model step is cut by the deadline, finish it in
+   * background mode instead of redoing it in another capped segment, where a long answer would be cut forever.
+   */
+  backgroundOnDeadline?: boolean;
+  /** Don't start a model step with less than this much hard budget left (default MIN_MODEL_STEP_MS). */
+  minStepMs?: number;
 }
+
+/** A model step only starts when at least this much of the hard deadline is left (else pause first, fresh segment). */
+export const MIN_MODEL_STEP_MS = 20_000;
+
+/** Deadline cuts without a background fallback before the run fails instead of looping forever. */
+export const MAX_DEADLINE_RETRIES = 3;
 
 export interface SegmentOutcome {
   status: RunStatus;
@@ -183,7 +201,7 @@ export async function runSegment(env: AgentEnv, runId: string, opts: SegmentOpti
       /* client gone: keep working, everything is persisted */
     }
   };
-  const t0 = Date.now();
+  const t0 = opts.startedAt ?? Date.now();
   const elapsed = () => Date.now() - t0;
 
   const run = await claimRun(db, runId);
@@ -214,7 +232,11 @@ export async function runSegment(env: AgentEnv, runId: string, opts: SegmentOpti
   const stopAc = new AbortController();
   active.set(runId, stopAc);
   const deadlineAc = new AbortController();
-  const deadlineTimer = opts.hardMs !== undefined ? setTimeout(() => deadlineAc.abort(new Error("deadline")), opts.hardMs) : undefined;
+  // The cap counts from the request (startedAt), so subtract the time already spent before this segment began.
+  const hardLeft = opts.hardMs === undefined
+    ? undefined
+    : Math.max(1, (opts.startedAt ?? Date.now()) + opts.hardMs - Date.now());
+  const deadlineTimer = hardLeft !== undefined ? setTimeout(() => deadlineAc.abort(new Error("deadline")), hardLeft) : undefined;
   const hb = setInterval(() => {
     heartbeat(db, runId)
       .then((s) => {
@@ -296,6 +318,7 @@ async function segmentBody(
 
   const finalize = async (status: RunStatus, reason?: string, error?: string): Promise<SegmentOutcome> => {
     cp.finishReason = reason;
+    await setPartial(db, runId, null).catch(() => {}); // no run is generating any more: stale live text must not linger
     await saveRun(db, runId, { status, finishedAt: new Date(), checkpoint: cp, error: error ?? null, stepCount });
     await appendStep(db, runId, "done", { status, reason, error });
     emit({ type: "done", status, reason });
@@ -318,11 +341,14 @@ async function segmentBody(
     return finalize("stopped", "stopped");
   };
 
-  const pause = async (reason: string): Promise<SegmentOutcome> => {
+  const pause = async (
+    reason: "budget" | "deadline",
+    extra: { mode?: "stream" | "background"; attempt?: number } = {},
+  ): Promise<SegmentOutcome> => {
     const ok = await transition(db, runId, ["running"], { status: "paused", checkpoint: cp, stepCount });
     if (!ok) return finalizeStopped(); // a stop request arrived meanwhile
-    await appendStep(db, runId, "continue", { reason });
-    emit({ type: "continue", runId });
+    await appendStep(db, runId, "continue", { reason, ...extra });
+    emit({ type: "continue", runId, reason, ...extra });
     return { status: "paused", reason };
   };
 
@@ -343,6 +369,8 @@ async function segmentBody(
   };
 
   let modelStepsThisSegment = 0;
+  /** Something was persisted in this segment (a model step or a batch of tool results): pausing now still advances. */
+  let progressed = false;
   const fileCache = new Map<string, Part>();
   let lastInputTokens = 0;
   const memSettings = await getMemorySettings(db);
@@ -527,12 +555,20 @@ async function segmentBody(
       cp.leafId = row.id;
       cp.pending = undefined;
       await saveCp();
+      progressed = true;
     }
 
     // ---------- 2. limits ----------
     if (stepCount >= run.maxSteps) return finalize("completed", "max_steps");
     if (modelStepsThisSegment > 0 && elapsed() >= opts.softMs) return pause("budget");
     if (deadlineSignal.aborted) return pause("deadline");
+    // Never start a model step the hard deadline would cut mid-stream: its output would be thrown away and
+    // regenerated (and a step longer than one segment would loop forever). Hand it a fresh segment instead.
+    // Only after progress: a segment must always move the run forward, otherwise a request whose pre-work ate the
+    // budget would pause immediately and the client would re-POST the same doomed segment forever.
+    if (progressed && deadline !== undefined && deadline - Date.now() < Math.min(opts.minStepMs ?? MIN_MODEL_STEP_MS, (opts.hardMs ?? 0) * 0.6)) {
+      return pause("budget");
+    }
     if (fullCaps) {
       if (fullCaps.maxSteps && stepCount >= fullCaps.maxSteps) return finalize("completed", "full_mode_step_cap");
       if (fullCaps.maxTokens || fullCaps.maxCostUsd) {
@@ -594,9 +630,16 @@ async function segmentBody(
       ...(cp.options?.reasoning ? { reasoning: cp.options.reasoning } : {}),
     };
     const b = new AssistantBuilder();
-    for await (const ev of streamChat(model.cfg, req, { signal: workSignal })) {
-      b.push(ev);
-      if (ev.type !== "finish" && ev.type !== "error") emit(ev);
+    // Background mode has no SSE consumer: publish the step's text as it is generated so polling pages show it live.
+    const live = run.mode === "background" ? partialWriter(db, runId, await lastStepSeq(db, runId).catch(() => 0)) : null;
+    try {
+      for await (const ev of streamChat(model.cfg, req, { signal: workSignal })) {
+        b.push(ev);
+        live?.push(ev);
+        if (ev.type !== "finish" && ev.type !== "error") emit(ev);
+      }
+    } finally {
+      await live?.stop();
     }
     modelStepsThisSegment++;
 
@@ -610,7 +653,32 @@ async function segmentBody(
         }
         return finalizeStopped();
       }
-      return pause("deadline"); // step is redone next segment
+      // The provider billed this attempt even though it was cut: record what it reported.
+      if (b.usage) {
+        lastInputTokens = b.usage.inputTokens ?? 0;
+        await recordLlmUsage(db, { providerId: model.providerId, model: model.model, modelRowId: model.modelRowId, runId, conversationId, usage: b.usage }, prices).catch(() => {});
+      }
+      if (opts.backgroundOnDeadline && run.mode === "stream") {
+        // The step alone outlasts a capped segment: finish it in background mode (long budget) instead of redoing the
+        // same step in another capped segment, where a long answer would be cut forever.
+        cp.deadlineRetries = 0;
+        const ok = await transition(db, runId, ["running"], { status: "paused", mode: "background", checkpoint: cp, stepCount });
+        if (!ok) return finalizeStopped();
+        await appendStep(db, runId, "continue", { reason: "deadline", mode: "background" });
+        // Publish what was already streamed so the page keeps it while the background step catches up.
+        await setPartial(db, runId, { base: await lastStepSeq(db, runId).catch(() => 0), text: b.text, reasoning: reasoningOf(b.message().parts) }).catch(() => {});
+        emit({ type: "continue", runId, reason: "deadline", mode: "background" });
+        return { status: "paused", reason: "deadline_background" };
+      }
+      // No background fallback: bound the retries. A step that never fits a segment must fail loudly, not loop.
+      cp.deadlineRetries = (cp.deadlineRetries ?? 0) + 1;
+      await saveCp();
+      if (cp.deadlineRetries >= MAX_DEADLINE_RETRIES) {
+        const message = `這個回覆連續 ${MAX_DEADLINE_RETRIES} 次超過部署平台的單段時限,已停止自動重試。請降低回覆長度,或改用背景模式重新送出。`;
+        emit({ type: "error", error: { message, code: "deadline_limit", retryable: false } });
+        return finalize("failed", "deadline_limit", message);
+      }
+      return pause("deadline", { attempt: cp.deadlineRetries }); // step is redone next segment
     }
 
     if (b.usage) {
@@ -632,10 +700,12 @@ async function segmentBody(
 
     const msg = b.message();
     stepCount++;
+    cp.deadlineRetries = 0;
     if (!msg.parts.length) return finalize("completed", b.finish ?? "empty");
     const row = await insertMessage(db, { conversationId, parentId: cp.leafId, role: "assistant", parts: msg.parts, runId, modelId: model.modelRowId });
     const dto = toMessageDTO(row);
     await appendStep(db, runId, "message", { message: dto, finish: b.finish, usage: b.usage });
+    if (live) await setPartial(db, runId, null).catch(() => {}); // the message step supersedes it
     emit({ type: "message", message: dto });
     cp.leafId = row.id;
 
@@ -648,6 +718,52 @@ async function segmentBody(
     }
     return finalize("completed", b.finish ?? "stop");
   }
+}
+
+/** Reasoning text of an assistant message (for the live partial). */
+function reasoningOf(parts: Part[]): string {
+  return parts.flatMap((p) => (p.type === "reasoning" ? [p.text] : [])).join("");
+}
+
+/** Interval between writes of a background step's live text (one write in flight at most). */
+export const PARTIAL_FLUSH_MS = 1000;
+
+/**
+ * Throttled writer of `runs.partial` for one model step. Text and reasoning accumulate in memory and are written at most
+ * every PARTIAL_FLUSH_MS; `stop()` flushes what is left. A step that is cut and redone simply starts a new partial.
+ */
+function partialWriter(db: AgentEnv["database"], runId: string, base: number) {
+  let text = "";
+  let reasoning = "";
+  let dirty = false;
+  let inflight: Promise<void> | null = null;
+  const flush = () => {
+    if (!dirty || inflight) return;
+    dirty = false;
+    inflight = setPartial(db, runId, { base, text, reasoning })
+      .catch(() => {})
+      .finally(() => {
+        inflight = null;
+      });
+  };
+  const timer = setInterval(flush, PARTIAL_FLUSH_MS);
+  return {
+    push(ev: { type: string; text?: string }) {
+      if (ev.type === "text-delta" && ev.text) {
+        text += ev.text;
+        dirty = true;
+      } else if (ev.type === "reasoning-delta" && ev.text) {
+        reasoning += ev.text;
+        dirty = true;
+      }
+    },
+    async stop() {
+      clearInterval(timer);
+      if (inflight) await inflight;
+      flush();
+      if (inflight) await inflight;
+    },
+  };
 }
 
 /**

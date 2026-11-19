@@ -58,7 +58,12 @@ export type AgentEvent =
   | { type: "message"; message: StoredMessageDTO }
   | { type: "tool-result"; callId: string; name: string; result: unknown; isError?: boolean }
   | { type: "approval-required"; approvals: PendingApprovalDTO[] }
-  /** Segment budget reached: re-POST /api/chat { runId, action: "continue" } to resume seamlessly. */
-  | { type: "continue"; runId: string }
+  /**
+   * Segment budget reached: re-POST /api/chat { runId, action: "continue" } to resume. `mode: "background"` means the
+   * step that was cut is finishing in background mode (the next POST answers 202), so the client must keep the text it
+   * already streamed until the background output catches up. `reason: "deadline"` means the step was cut by the
+   * platform's hard limit and will be regenerated from its start: the client must replace that text, never append.
+   */
+  | { type: "continue"; runId: string; mode?: "stream" | "background"; reason?: "budget" | "deadline" | "deadline_limit"; attempt?: number }
   | { type: "done"; status: RunStatus; reason?: string }
   | { type: "error"; error: LlmErrorInfo };

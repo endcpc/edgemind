@@ -5,8 +5,21 @@ import type { AppEnv } from "./env";
 /** Platform hooks provided by netlify.ts / cloudflare.ts / vercel.ts (or tests). */
 export interface Platform {
   name: "netlify" | "cloudflare" | "vercel" | "node" | "test";
-  /** Time budget of one streamed /api/chat segment. Default: soft 50s, hard 57s (Netlify 60s cap). */
+  /**
+   * Time budget of one streamed /api/chat segment, counted from the request's arrival (not from runSegment): auth,
+   * migrations, skill installs and run creation happen first. Default (unknown platform): soft 120 s, no hard cap.
+   */
   segment?: { softMs: number; hardMs?: number };
+  /**
+   * Don't start a model step with less hard budget than this. Default 20 s. Keep it above the time needed to persist a
+   * checkpoint and emit `continue` (a few DB round trips).
+   */
+  minStepMs?: number;
+  /**
+   * Streamed segments have a hard wall-clock cap here: a model step cut by it moves the run to background mode instead
+   * of being redone in another capped segment (where a long answer would be cut forever).
+   */
+  backgroundOnDeadline?: boolean;
   /** Time budget of one background drive invocation. */
   background?: { softMs: number; hardMs?: number };
   /**
@@ -44,6 +57,8 @@ export interface HonoEnv {
     database: Database;
     encKey: Uint8Array;
     sessionId: string;
+    /** Request arrival time (ms), set by the outermost middleware: platform wall-clock caps count from here. */
+    reqStart: number;
   };
 }
 

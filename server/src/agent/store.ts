@@ -29,10 +29,19 @@ export interface Checkpoint {
   finishReason?: string;
   /** Spend-cap warning (80 %) already recorded for this run. */
   spendWarned?: boolean;
+  /**
+   * How many model steps of this run were cut by a segment's hard deadline and thrown away (no platform background
+   * mode to finish them). Bounded: a step that never fits a segment must fail loudly instead of looping forever.
+   */
+  deadlineRetries?: number;
 }
 
-/** A segment that has not heartbeated for this long is considered dead and its run can be re-claimed. */
-export const STALE_LEASE_MS = 75_000;
+/**
+ * A segment that has not heartbeated for this long is considered dead and its run can be re-claimed. Heartbeats run
+ * every 3 s, so 30 s is ten missed beats: a platform kill frees the run in half a minute instead of 75 s, while a slow
+ * tool batch never loses its lease.
+ */
+export const STALE_LEASE_MS = 30_000;
 
 /** Atomically take the run lease. Returns the row when claimed. */
 export async function claimRun(database: Database, runId: string, staleMs = STALE_LEASE_MS): Promise<RunRow | undefined> {
@@ -56,6 +65,25 @@ export async function getRun(database: Database, runId: string): Promise<RunRow 
 export async function heartbeat(database: Database, runId: string): Promise<RunStatus | undefined> {
   const rows = await database.query<{ status: RunStatus }>(`UPDATE runs SET updated_at = now() WHERE id = $1 RETURNING status`, [runId]);
   return rows[0]?.status;
+}
+
+/**
+ * Live text of the model step a background run is generating (null clears it). Also refreshes the lease. `base` is the
+ * last step seq when the step began: once a later step exists, the partial is stale and pages ignore it.
+ */
+export interface RunPartial {
+  base: number;
+  text: string;
+  reasoning: string;
+}
+
+export async function setPartial(database: Database, runId: string, partial: RunPartial | null): Promise<void> {
+  await database.query(`UPDATE runs SET partial = $2::jsonb, updated_at = now() WHERE id = $1`, [runId, partial === null ? null : JSON.stringify(partial)]);
+}
+
+export async function lastStepSeq(database: Database, runId: string): Promise<number> {
+  const rows = await database.query<{ n: number }>(`SELECT coalesce(max(seq), 0)::int AS n FROM run_steps WHERE run_id = $1`, [runId]);
+  return Number(rows[0]?.n ?? 0);
 }
 
 /** Append to the run's step log with a DB-assigned sequence number (safe with concurrent writers). */

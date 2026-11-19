@@ -43,6 +43,13 @@ export function createApp(deps: AppDeps) {
     return c.json({ error: "internal_error", message: err.message }, 500);
   });
 
+  // The platform's wall-clock cap (Netlify: 60 s) counts from the request, not from runSegment: auth, migrations,
+  // skill installs and run creation all happen first. Record it before any of that so segment budgets can subtract it.
+  app.use("*", async (c, next) => {
+    c.set("reqStart", Date.now());
+    await next();
+  });
+
   // API answers are per-user live data: never let a browser / CDN cache serve a stale list (e.g. 設定 → 密鑰 after a save).
   app.use("*", async (c, next) => {
     await next();
