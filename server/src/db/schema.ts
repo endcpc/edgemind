@@ -179,6 +179,14 @@ export const runs = pgTable("runs", {
   maxSteps: integer("max_steps").notNull().default(25),
   /** Serialized loop state for `continue` across ~50s segments. */
   checkpoint: jsonb("checkpoint"),
+  /**
+   * Background mode only: text/reasoning of the model step being generated right now (throttled, ~1 s), so the page
+   * polling the step log can show it live. `base` = last step seq when the step began (stale once a later step exists).
+   */
+  partial: jsonb("partial"),
+  /** Background runs restarted by the supervisor (dead background function / lost chain), see routes/chat.ts. */
+  rescueCount: integer("rescue_count").notNull().default(0),
+  rescuedAt: timestamp("rescued_at", { withTimezone: true }),
   error: text("error"),
   createdAt: createdAt(),
   updatedAt: updatedAt(),

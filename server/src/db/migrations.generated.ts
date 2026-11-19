@@ -175,5 +175,14 @@ export const MIGRATIONS: { tag: string; hash: string; statements: string[] }[] =
    "ALTER TABLE \"usage_logs\" ADD COLUMN \"conversation_id\" uuid;",
    "CREATE INDEX \"usage_logs_run_idx\" ON \"usage_logs\" USING btree (\"run_id\");"
   ]
+ },
+ {
+  "tag": "0010_perfect_hellion",
+  "hash": "dd41bc38cee587e14b0be81b63ed38f19dc73a3dde1fded758b462448c522ee3",
+  "statements": [
+   "ALTER TABLE \"runs\" ADD COLUMN \"partial\" jsonb;",
+   "ALTER TABLE \"runs\" ADD COLUMN \"rescue_count\" integer DEFAULT 0 NOT NULL;",
+   "ALTER TABLE \"runs\" ADD COLUMN \"rescued_at\" timestamp with time zone;"
+  ]
  }
 ];

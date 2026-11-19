@@ -58,6 +58,25 @@ export async function heartbeat(database: Database, runId: string): Promise<RunS
   return rows[0]?.status;
 }
 
+/**
+ * Live text of the model step a background run is generating (null clears it). Also refreshes the lease. `base` is the
+ * last step seq when the step began: once a later step exists, the partial is stale and pages ignore it.
+ */
+export interface RunPartial {
+  base: number;
+  text: string;
+  reasoning: string;
+}
+
+export async function setPartial(database: Database, runId: string, partial: RunPartial | null): Promise<void> {
+  await database.query(`UPDATE runs SET partial = $2::jsonb, updated_at = now() WHERE id = $1`, [runId, partial === null ? null : JSON.stringify(partial)]);
+}
+
+export async function lastStepSeq(database: Database, runId: string): Promise<number> {
+  const rows = await database.query<{ n: number }>(`SELECT coalesce(max(seq), 0)::int AS n FROM run_steps WHERE run_id = $1`, [runId]);
+  return Number(rows[0]?.n ?? 0);
+}
+
 /** Append to the run's step log with a DB-assigned sequence number (safe with concurrent writers). */
 export async function appendStep(database: Database, runId: string, kind: string, payload: unknown): Promise<number> {
   for (let attempt = 0; ; attempt++) {

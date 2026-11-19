@@ -19,7 +19,7 @@ import { BadInput } from "../lib/errors";
 import { hmacHex, timingSafeEqual } from "../lib/crypto";
 import { aiBinding } from "./kb";
 import { abortLocalRun, closeStoppedRun, driveRun, pendingApprovals, runSegment, type AgentEnv } from "../agent/loop";
-import { appendStep, getRun, insertMessage, STALE_LEASE_MS, toMessageDTO, transition, type Checkpoint, type RunOptions } from "../agent/store";
+import { appendStep, getRun, insertMessage, STALE_LEASE_MS, toMessageDTO, transition, type Checkpoint, type RunOptions, type RunPartial } from "../agent/store";
 import { builtinRegistry } from "../agent/tools";
 import { extractMemories } from "../memory";
 import { fileStore } from "./files";
@@ -116,10 +116,36 @@ function sse(c: Ctx, work: (emit: (e: AgentEvent) => void) => Promise<unknown>):
  * died, e.g. a platform time limit or a dropped connection). `resumable`: a stream-mode run that only moves on when a
  * page POSTs `continue` (paused between segments, or stale) — the UI must offer that instead of waiting forever.
  */
-export function runLiveness(run: { status: string; mode: string; updatedAt: Date }, now = Date.now()): { stale: boolean; resumable: boolean } {
+export function runLiveness(
+  run: { status: string; mode: string; updatedAt: Date; rescueCount?: number },
+  now = Date.now(),
+): { stale: boolean; resumable: boolean } {
   const stale = ["running", "pending", "stopping"].includes(run.status) && now - run.updatedAt.getTime() > STALE_LEASE_MS;
-  const resumable = run.mode === "stream" && (run.status === "paused" || (stale && run.status !== "stopping"));
+  const resumable = run.mode === "stream"
+    ? run.status === "paused" || (stale && run.status !== "stopping")
+    // A background run nobody is executing after the supervisor's restarts: the page offers 繼續執行 instead of spinning.
+    : backgroundOrphaned(run, now) && (run.rescueCount ?? 0) >= MAX_BACKGROUND_RESCUES;
   return { stale, resumable };
+}
+
+/** A paused/pending background run should be picked up by the next background invocation within seconds. */
+export const BACKGROUND_IDLE_MS = 20_000;
+/** Automatic restarts of an orphaned background run before the page shows 繼續執行. */
+export const MAX_BACKGROUND_RESCUES = 3;
+/** Minimum time between two automatic restarts of the same run. */
+const RESCUE_INTERVAL_MS = 60_000;
+
+/**
+ * No background function is executing this background run: its lease went stale (the function died, hit its time limit
+ * or crashed), or it stayed paused/pending (the chained invocation was never started, or the page that should have
+ * started it went away).
+ */
+export function backgroundOrphaned(run: { status: string; mode: string; updatedAt: Date }, now = Date.now()): boolean {
+  if (run.mode !== "background") return false;
+  const idle = now - run.updatedAt.getTime();
+  if (run.status === "running") return idle > STALE_LEASE_MS;
+  if (run.status === "paused" || run.status === "pending") return idle > BACKGROUND_IDLE_MS;
+  return false;
 }
 
 async function lastSeq(c: Ctx, runId: string): Promise<number> {
@@ -211,6 +237,25 @@ export function mountChat(app: Hono<HonoEnv>, deps: AppDeps): ChatApi {
     );
   }
 
+  /**
+   * Called while a page watches a run (step-log polling, conversation load): restart an orphaned background run, at most
+   * MAX_BACKGROUND_RESCUES times and once per RESCUE_INTERVAL_MS (atomic, so concurrent polls start one invocation).
+   */
+  async function superviseBackground(c: Ctx, run: { id: string; status: string; mode: string; updatedAt: Date }) {
+    if (!backgroundOrphaned(run)) return;
+    const database = c.get("database");
+    const rows = await database.query<{ rescue_count: number }>(
+      `UPDATE runs SET rescue_count = rescue_count + 1, rescued_at = now()
+         WHERE id = $1 AND mode = 'background' AND rescue_count < $2
+           AND (rescued_at IS NULL OR rescued_at < now() - ($3::int * interval '1 millisecond'))
+       RETURNING rescue_count`,
+      [run.id, MAX_BACKGROUND_RESCUES, RESCUE_INTERVAL_MS],
+    );
+    if (!rows.length) return;
+    console.warn(`[edgemind] background run ${run.id} orphaned (${run.status}); restart ${rows[0].rescue_count}/${MAX_BACKGROUND_RESCUES}`);
+    await startBackground(c, run.id).catch((e) => console.error("[edgemind] background restart failed", e));
+  }
+
   async function pickModel(c: Ctx, explicit: unknown, conv?: { modelId: string | null; projectId: string | null }): Promise<string> {
     const db = c.get("database").db;
     const database = c.get("database");
@@ -278,7 +323,11 @@ export function mountChat(app: Hono<HonoEnv>, deps: AppDeps): ChatApi {
       const run = await getRun(database, body.runId);
       if (!run) return c.json({ error: "not_found", message: "找不到執行紀錄" }, 404);
       if (run.mode === "background") {
-        if (run.status === "paused" || run.status === "pending") await startBackground(c, run.id);
+        // 繼續執行 (or the page's automatic resume): start a background invocation unless one is alive; fresh restarts.
+        if (run.status === "paused" || run.status === "pending" || backgroundOrphaned(run)) {
+          await database.query(`UPDATE runs SET rescue_count = 0, rescued_at = NULL WHERE id = $1`, [run.id]);
+          await startBackground(c, run.id);
+        }
         return c.json({ runId: run.id, conversationId: run.conversationId, status: run.status }, 202);
       }
       const env = agentEnv(c);
@@ -380,13 +429,21 @@ export function mountChat(app: Hono<HonoEnv>, deps: AppDeps): ChatApi {
     const run = await getRun(c.get("database"), id);
     if (!run) return c.json({ error: "not_found", message: "找不到執行紀錄" }, 404);
     const steps = await c.get("database").db.select().from(runSteps).where(and(eq(runSteps.runId, id), gt(runSteps.seq, after))).orderBy(asc(runSteps.seq)).limit(500);
+    await superviseBackground(c, run).catch((e) => console.error("[edgemind] supervise failed", e));
+    const nextAfter = steps.length ? steps[steps.length - 1].seq : after;
+    // Live text of the background step being generated; stale (dropped) once a later step exists.
+    const p = run.partial as RunPartial | null;
+    const partial = run.mode === "background" && run.status === "running" && p && p.base >= nextAfter && steps.length < 500
+      ? { text: p.text, reasoning: p.reasoning }
+      : null;
     return c.json({
       status: run.status,
       mode: run.mode,
       ...runLiveness(run),
       stepCount: run.stepCount,
       steps: steps.map((s) => ({ seq: s.seq, kind: s.kind, payload: s.payload, createdAt: s.createdAt.toISOString() })),
-      nextAfter: steps.length ? steps[steps.length - 1].seq : after,
+      nextAfter,
+      partial,
     });
   });
 
@@ -489,6 +546,7 @@ export function mountChat(app: Hono<HonoEnv>, deps: AppDeps): ChatApi {
     const [open] = await db.select().from(runs)
       .where(and(eq(runs.conversationId, id), inArray(runs.status, ["pending", "running", "paused", "waiting_approval", "stopping"])))
       .orderBy(desc(runs.createdAt)).limit(1);
+    if (open) await superviseBackground(c, open).catch((e) => console.error("[edgemind] supervise failed", e));
     const activeRun = open
       ? { id: open.id, status: open.status, mode: open.mode, ...runLiveness(open), approvals: await pendingApprovals(c.get("database"), open.id, registry), lastSeq: await lastSeq(c, open.id) }
       : null;

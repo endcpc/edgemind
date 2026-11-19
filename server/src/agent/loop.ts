@@ -25,7 +25,7 @@ import { buildMcpTools, mcpRisks } from "../mcp/service";
 import { estimateTokens, getMemorySettings, helperModel, maybeCompact, memoryRecaller, messageTokens } from "../memory";
 import { evaluate, loadGrants, loadPolicies, resolveMode, type Policy } from "./permissions";
 import {
-  appendStep, claimRun, getRun, heartbeat, insertMessage, saveRun, toMessageDTO, transition, STALE_LEASE_MS,
+  appendStep, claimRun, getRun, heartbeat, insertMessage, lastStepSeq, saveRun, setPartial, toMessageDTO, transition, STALE_LEASE_MS,
   type Checkpoint, type PendingTools, type RunRow,
 } from "./store";
 import { ToolDeferred, type Tool, type ToolContext, type ToolRegistry } from "./tools";
@@ -611,9 +611,16 @@ async function segmentBody(
       ...(cp.options?.reasoning ? { reasoning: cp.options.reasoning } : {}),
     };
     const b = new AssistantBuilder();
-    for await (const ev of streamChat(model.cfg, req, { signal: workSignal })) {
-      b.push(ev);
-      if (ev.type !== "finish" && ev.type !== "error") emit(ev);
+    // Background mode has no SSE consumer: publish the step's text as it is generated so polling pages show it live.
+    const live = run.mode === "background" ? partialWriter(db, runId, await lastStepSeq(db, runId).catch(() => 0)) : null;
+    try {
+      for await (const ev of streamChat(model.cfg, req, { signal: workSignal })) {
+        b.push(ev);
+        live?.push(ev);
+        if (ev.type !== "finish" && ev.type !== "error") emit(ev);
+      }
+    } finally {
+      await live?.stop();
     }
     modelStepsThisSegment++;
     if (!b.error) progressed = true;
@@ -662,6 +669,7 @@ async function segmentBody(
     const row = await insertMessage(db, { conversationId, parentId: cp.leafId, role: "assistant", parts: msg.parts, runId, modelId: model.modelRowId });
     const dto = toMessageDTO(row);
     await appendStep(db, runId, "message", { message: dto, finish: b.finish, usage: b.usage });
+    if (live) await setPartial(db, runId, null).catch(() => {}); // the message step supersedes it
     emit({ type: "message", message: dto });
     cp.leafId = row.id;
 
@@ -674,6 +682,47 @@ async function segmentBody(
     }
     return finalize("completed", b.finish ?? "stop");
   }
+}
+
+/** Interval between writes of a background step's live text (one write in flight at most). */
+export const PARTIAL_FLUSH_MS = 1000;
+
+/**
+ * Throttled writer of `runs.partial` for one model step. Text and reasoning accumulate in memory and are written at most
+ * every PARTIAL_FLUSH_MS; `stop()` flushes what is left. A step that is cut and redone simply starts a new partial.
+ */
+function partialWriter(db: AgentEnv["database"], runId: string, base: number) {
+  let text = "";
+  let reasoning = "";
+  let dirty = false;
+  let inflight: Promise<void> | null = null;
+  const flush = () => {
+    if (!dirty || inflight) return;
+    dirty = false;
+    inflight = setPartial(db, runId, { base, text, reasoning })
+      .catch(() => {})
+      .finally(() => {
+        inflight = null;
+      });
+  };
+  const timer = setInterval(flush, PARTIAL_FLUSH_MS);
+  return {
+    push(ev: { type: string; text?: string }) {
+      if (ev.type === "text-delta" && ev.text) {
+        text += ev.text;
+        dirty = true;
+      } else if (ev.type === "reasoning-delta" && ev.text) {
+        reasoning += ev.text;
+        dirty = true;
+      }
+    },
+    async stop() {
+      clearInterval(timer);
+      if (inflight) await inflight;
+      flush();
+      if (inflight) await inflight;
+    },
+  };
 }
 
 /**

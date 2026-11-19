@@ -45,6 +45,9 @@ interface ActiveRunDTO {
 
 type Effort = "" | "low" | "medium" | "high";
 
+/** Step-log polling interval (background mode shows the step's live text at this pace). */
+const POLL_MS = 1000;
+
 const emptyLive = (runId: string | null, mode: LiveState["mode"]): LiveState => ({
   runId, mode, text: "", reasoning: "", reasoningOpen: false, calls: [], results: {}, approvals: [], status: "running",
 });
@@ -263,7 +266,7 @@ export function ChatPage() {
         break;
       case "message":
         addMessage(e.message);
-        setLive((l) => l && { ...l, text: "", reasoning: "", reasoningOpen: false, calls: [] });
+        setLive((l) => l && { ...l, text: "", reasoning: "", reasoningOpen: false, held: false, calls: [] });
         break;
       case "tool-result":
         setLive((l) => l && { ...l, results: { ...l.results, [e.callId]: { result: e.result, isError: e.isError } } });
@@ -274,8 +277,13 @@ export function ChatPage() {
         break;
       case "continue":
         ctx.flags.cont = true;
+        if (e.mode === "background") {
+          // The step goes on in background mode: keep what was streamed until the background step's live text catches up.
+          setLive((l) => l && { ...l, held: !!(l.text || l.reasoning), reasoningOpen: false });
+          break;
+        }
         // The next segment re-streams an interrupted step from its start: drop the partial text so it isn't doubled.
-        setLive((l) => l && { ...l, text: "", reasoning: "", reasoningOpen: false, calls: l.calls.filter((c) => c.ended && l.results[c.id]) });
+        setLive((l) => l && { ...l, text: "", reasoning: "", reasoningOpen: false, held: false, calls: l.calls.filter((c) => c.ended && l.results[c.id]) });
         break;
       case "done":
         ctx.flags.status = e.status;
@@ -356,20 +364,34 @@ export function ChatPage() {
     const tick = async () => {
       if (token.stop) return;
       try {
-        const r = await api<{ status: string; mode?: string; stale?: boolean; resumable?: boolean; steps: { seq: number; kind: string; payload: any }[]; nextAfter: number }>(`/runs/${runId}/events?after=${seq}`);
+        const r = await api<{
+          status: string; mode?: string; stale?: boolean; resumable?: boolean;
+          steps: { seq: number; kind: string; payload: any }[]; nextAfter: number;
+          /** live text of the background step being generated (null between steps) */
+          partial?: { text: string; reasoning: string } | null;
+        }>(`/runs/${runId}/events?after=${seq}`);
         if (token.stop) return;
         let needApprovals = false;
         for (const s of r.steps) {
           if (s.kind === "message") {
             addMessage(s.payload.message);
             conv = s.payload.message.conversationId ?? conv;
-            setLive((l) => l && { ...l, calls: [] });
+            setLive((l) => l && { ...l, text: "", reasoning: "", reasoningOpen: false, held: false, calls: [] });
           } else if (s.kind === "tool_result") {
             setLive((l) => l && { ...l, results: { ...l.results, [s.payload.callId]: { result: s.payload.result, isError: s.payload.isError } } });
           } else if (s.kind === "approval") needApprovals = true;
           else if (s.kind === "error") setLive((l) => l && { ...l, error: s.payload?.error?.message ?? s.payload?.message ?? "執行失敗" });
         }
         seq = r.nextAfter;
+        const p = r.partial;
+        if (p && (p.text || p.reasoning)) {
+          setLive((l) => {
+            if (!l) return l;
+            // still behind the text streamed before the switch to background mode: keep showing that
+            if (l.held && p.text.length + p.reasoning.length < l.text.length + l.reasoning.length) return l;
+            return { ...l, text: p.text, reasoning: p.reasoning, reasoningOpen: !p.text && !!p.reasoning, held: false };
+          });
+        }
         if (needApprovals || r.status === "waiting_approval") {
           const run = await api<{ approvals: PendingApprovalDTO[] }>(`/runs/${runId}`);
           setLive((l) => l && { ...l, approvals: run.approvals });
@@ -404,7 +426,7 @@ export function ChatPage() {
       } catch {
         /* transient: retry */
       }
-      setTimeout(tick, 1500);
+      setTimeout(tick, POLL_MS);
     };
     tick();
   }
